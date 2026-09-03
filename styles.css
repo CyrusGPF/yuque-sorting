@@ -1,0 +1,9 @@
+.yq-order-drag-source {
+  opacity: 0.45;
+}
+
+.yq-order-drag-over {
+  outline: 1px solid var(--interactive-accent);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+}
