@@ -14,6 +14,7 @@ import {
   moveGuid,
   normalizeGuid,
   removeGuidFromOrders,
+  sanitizePortableName,
   sortEntries,
   uniqueKnownOrder,
 } from "./src/order-utils";
@@ -460,6 +461,8 @@ export default class YqOrderDragPlugin extends Plugin {
     });
 
     let seeded = 0;
+    // V1 规则 2 兜底：已按目录名匹配并采用语雀 guid 的目录路径（同一目录只认领一次）。
+    const adoptedFolderPaths = new Set<string>();
     for (const manifestFile of manifests) {
       let raw: any;
       let text: string;
@@ -495,6 +498,21 @@ export default class YqOrderDragPlugin extends Plugin {
           if (!guid) return;
           const item = byGuid.get(guid) || folderByGuid.get(guid) || null;
           if (!item) {
+            // V1 规则 2：空正文父级文档只有目录、没有同名笔记文件，guid 匹配不到。
+            // 按"目录名"兜底匹配（同名去重后目录名可能是 原名 或 原名-N），
+            // 把语雀 guid 赋予该目录，使其回到 manifest 中的语雀位置。
+            const folder = this.matchManifestNodeToFolder(
+              fallbackFolder, node, adoptedFolderPaths, new Set(manifestGuids),
+            );
+            if (folder) {
+              this.data.folderGuids[folder.path] = guid;
+              folderByGuid.set(guid, folder);
+              const parentFolder = folder.parent || fallbackFolder;
+              const key = this.folderKeySync(parentFolder);
+              append(key, guid);
+              if (Array.isArray(node.children) && node.children.length) visit(node.children, folder);
+              return;
+            }
             // Do not persist manifest-only identities before their files arrive;
             // a later create event will retry seeding once the item exists.
             if (Array.isArray(node.children) && node.children.length) visit(node.children, fallbackFolder);
@@ -558,6 +576,38 @@ export default class YqOrderDragPlugin extends Plugin {
   private findFolderForNote(file: TFile): TFolder | null {
     const folder = this.app.vault.getAbstractFileByPath(stripMarkdown(file.path));
     return folder instanceof TFolder ? folder : null;
+  }
+
+  /**
+   * V1 规则 2 兜底：为空正文父级文档（只有目录、无同名笔记）按目录名匹配 manifest 节点。
+   * 候选名 = sanitize(title) 精确名，其后顺带尝试 title-N（导出端同名去重后的形式）。
+   * 同名组内"首个保留原名"由扫描顺序复现（manifest 前序遍历顺序 = 语雀目录序）。
+   */
+  private matchManifestNodeToFolder(
+    fallbackFolder: TFolder | null,
+    node: any,
+    adoptedFolderPaths: Set<string>,
+    manifestGuidSet: Set<string>,
+  ): TFolder | null {
+    const base = sanitizePortableName(node?.title);
+    if (!base) return null;
+    const scope = fallbackFolder
+      ? fallbackFolder.children
+      : this.app.vault.getRoot().children;
+    const parentFolders = scope.filter((child): child is TFolder => child instanceof TFolder);
+    const candidates: string[] = [base];
+    for (let n = 1; n <= 64; n += 1) candidates.push(`${base}-${n}`);
+    for (const name of candidates) {
+      const folder = parentFolders.find((f) => f.name === name);
+      if (!folder) continue;
+      if (adoptedFolderPaths.has(folder.path)) continue;
+      const existingGuid = this.data.folderGuids[folder.path];
+      // 已被其它 manifest 节点（如正文父级）占用的目录跳过，避免抢占。
+      if (existingGuid && manifestGuidSet.has(existingGuid)) continue;
+      adoptedFolderPaths.add(folder.path);
+      return folder;
+    }
+    return null;
   }
 
   private patchFileExplorer(): void {

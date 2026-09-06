@@ -27,6 +27,18 @@ var import_obsidian = require("obsidian");
 
 // src/order-utils.ts
 var ROOT_FOLDER_KEY = "__root__";
+function sanitizePortableName(name) {
+  if (!name) return "";
+  let result = name.normalize("NFKC").replace(/[\u0000-\u001f\u007f\u200B-\u200D\uFEFF]/g, "").replace(/[\\/<>:"|?*]/g, "_").replace(/\s+/g, "_").replace(/_+/g, "_").replace(/[. ]+$/g, "").trim().replace(/^\.+|\.+$/g, "");
+  if (!result) return "";
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(result)) {
+    result = `_${result}`;
+  }
+  if (result.length > 120) {
+    result = result.slice(0, 120).replace(/[. ]+$/g, "");
+  }
+  return result;
+}
 function normalizeGuid(value) {
   if (typeof value !== "string" && typeof value !== "number") return null;
   const guid = String(value).trim();
@@ -444,6 +456,7 @@ ${text}`;
       else if (isMarkdown(item)) byGuid.set(guid, item);
     });
     let seeded = 0;
+    const adoptedFolderPaths = /* @__PURE__ */ new Set();
     for (const manifestFile of manifests) {
       let raw;
       let text;
@@ -476,6 +489,21 @@ ${text}`;
           if (!guid) return;
           const item = byGuid.get(guid) || folderByGuid.get(guid) || null;
           if (!item) {
+            const folder = this.matchManifestNodeToFolder(
+              fallbackFolder,
+              node,
+              adoptedFolderPaths,
+              new Set(manifestGuids)
+            );
+            if (folder) {
+              this.data.folderGuids[folder.path] = guid;
+              folderByGuid.set(guid, folder);
+              const parentFolder2 = folder.parent || fallbackFolder;
+              const key2 = this.folderKeySync(parentFolder2);
+              append(key2, guid);
+              if (Array.isArray(node.children) && node.children.length) visit(node.children, folder);
+              return;
+            }
             if (Array.isArray(node.children) && node.children.length) visit(node.children, fallbackFolder);
             return;
           }
@@ -518,6 +546,29 @@ ${text}`;
   findFolderForNote(file) {
     const folder = this.app.vault.getAbstractFileByPath(stripMarkdown(file.path));
     return folder instanceof import_obsidian.TFolder ? folder : null;
+  }
+  /**
+   * V1 规则 2 兜底：为空正文父级文档（只有目录、无同名笔记）按目录名匹配 manifest 节点。
+   * 候选名 = sanitize(title) 精确名，其后顺带尝试 title-N（导出端同名去重后的形式）。
+   * 同名组内"首个保留原名"由扫描顺序复现（manifest 前序遍历顺序 = 语雀目录序）。
+   */
+  matchManifestNodeToFolder(fallbackFolder, node, adoptedFolderPaths, manifestGuidSet) {
+    const base = sanitizePortableName(node == null ? void 0 : node.title);
+    if (!base) return null;
+    const scope = fallbackFolder ? fallbackFolder.children : this.app.vault.getRoot().children;
+    const parentFolders = scope.filter((child) => child instanceof import_obsidian.TFolder);
+    const candidates = [base];
+    for (let n = 1; n <= 64; n += 1) candidates.push(`${base}-${n}`);
+    for (const name of candidates) {
+      const folder = parentFolders.find((f) => f.name === name);
+      if (!folder) continue;
+      if (adoptedFolderPaths.has(folder.path)) continue;
+      const existingGuid = this.data.folderGuids[folder.path];
+      if (existingGuid && manifestGuidSet.has(existingGuid)) continue;
+      adoptedFolderPaths.add(folder.path);
+      return folder;
+    }
+    return null;
   }
   patchFileExplorer() {
     var _a;
