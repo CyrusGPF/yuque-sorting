@@ -1,5 +1,6 @@
 import {
   App,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -9,14 +10,24 @@ import {
   TFolder,
 } from "obsidian";
 import {
+  InventoryComparison,
+  InventoryEntry,
   ROOT_FOLDER_KEY,
   SortableEntry,
+  compareInventories,
+  detachFolderNoteFromOrder,
+  folderIdentityPathForNote,
+  insertGuid,
+  migratePathMappings,
   moveGuid,
   normalizeGuid,
+  purgeFolderGuidsFromOrders,
+  reconcileOrderNonDestructive,
   removeGuidFromOrders,
+  relocateGuid,
+  replaceGuidInOrders,
   sanitizePortableName,
   sortEntries,
-  uniqueKnownOrder,
 } from "./src/order-utils";
 
 const MANIFEST_NAME = "_yuque_order.json";
@@ -25,7 +36,6 @@ interface OrderSettings {
   orderFrontmatterKey: string;
   newItemPlacement: "top" | "bottom";
   fallbackSort: "name" | "name-last";
-  autoSeedFromManifest: boolean;
   persistOrderOnCreateDelete: boolean;
   enableDrag: boolean;
 }
@@ -35,19 +45,18 @@ interface OrderData {
   settings: OrderSettings;
   orderByFolder: Record<string, string[]>;
   folderGuids: Record<string, string>;
-  manifestSignatures: Record<string, string>;
+  fileGuids: Record<string, string>;
 }
 
 const DEFAULT_SETTINGS: OrderSettings = {
   orderFrontmatterKey: "guid",
   newItemPlacement: "bottom",
   fallbackSort: "name-last",
-  autoSeedFromManifest: true,
   persistOrderOnCreateDelete: true,
   enableDrag: true,
 };
 
-function isMarkdown(file: TAbstractFile | null): file is TFile {
+function isMarkdown(file: TAbstractFile | null): boolean {
   return file instanceof TFile && file.extension.toLowerCase() === "md";
 }
 
@@ -70,6 +79,64 @@ function createGuid(prefix = "obs"): string {
   return `${prefix}-${uuid || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
 }
 
+interface ManifestCheckReport extends InventoryComparison {
+  invalidManifests: string[];
+}
+
+function manifestIssueCount(report: ManifestCheckReport): number {
+  return report.missing.length
+    + report.extra.length
+    + report.moved.length
+    + report.duplicateManifestGuids.length
+    + report.duplicateActualGuids.length
+    + report.invalidManifests.length;
+}
+
+class ManifestImportConfirmModal extends Modal {
+  private settled = false;
+
+  constructor(app: App, private report: ManifestCheckReport, private resolveChoice: (choice: boolean) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("语雀顺序清单与当前库不一致");
+    this.contentEl.createEl("p", {
+      text: "继续导入只会调整能够匹配的项目顺序，不会创建、删除或移动文件。请确认是否继续。",
+    });
+    const groups: Array<[string, string[]]> = [
+      ["清单中有、当前库缺失", this.report.missing.map((entry) => entry.label)],
+      ["当前库多出的项目", this.report.extra.map((entry) => entry.label)],
+      ["所在目录与清单不符", this.report.moved.map(({ actual }) => actual.label)],
+      ["清单中的重复 GUID", this.report.duplicateManifestGuids],
+      ["当前库中的重复 GUID", this.report.duplicateActualGuids],
+      ["无法读取的清单", this.report.invalidManifests],
+    ];
+    groups.forEach(([title, items]) => {
+      if (!items.length) return;
+      this.contentEl.createEl("h4", { text: `${title}（${items.length}）` });
+      const list = this.contentEl.createEl("ul");
+      items.slice(0, 8).forEach((item) => list.createEl("li", { text: item }));
+      if (items.length > 8) list.createEl("li", { text: `另有 ${items.length - 8} 项……` });
+    });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("放弃").onClick(() => this.finish(false)))
+      .addButton((button) => button.setButtonText("仍然导入").setWarning().onClick(() => this.finish(true)));
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.settled) this.resolveChoice(false);
+  }
+
+  private finish(choice: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolveChoice(choice);
+    this.close();
+  }
+}
+
 export default class YqOrderDragPlugin extends Plugin {
   data!: OrderData;
   private guidByPath = new Map<string, string>();
@@ -81,7 +148,6 @@ export default class YqOrderDragPlugin extends Plugin {
   private domOrderFrame: number | null = null;
   private explorerSetup = false;
   private manifestNoticeShown = false;
-  private autoSeedNoticeShown = false;
   private dragSourcePath = "";
 
   async onload(): Promise<void> {
@@ -90,12 +156,11 @@ export default class YqOrderDragPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleRename(file, oldPath)));
-    this.registerEvent(this.app.vault.on("modify", (file) => void this.handleModify(file)));
 
     this.addCommand({
       id: "import-yuque-order-manifest",
       name: "导入/重同步语雀顺序清单",
-      callback: () => void this.seedFromManifests(true),
+      callback: () => void this.requestManifestImport(),
     });
     this.addCommand({
       id: "refresh-yuque-order",
@@ -128,7 +193,23 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   normalizeData(saved: Partial<OrderData> | null): OrderData {
-    const savedSettings = saved?.settings || {};
+    const savedSettings = (saved?.settings || {}) as Partial<OrderSettings>;
+    const supportedSettings: Partial<OrderSettings> = {};
+    if (typeof savedSettings.orderFrontmatterKey === "string") {
+      supportedSettings.orderFrontmatterKey = savedSettings.orderFrontmatterKey;
+    }
+    if (savedSettings.newItemPlacement === "top" || savedSettings.newItemPlacement === "bottom") {
+      supportedSettings.newItemPlacement = savedSettings.newItemPlacement;
+    }
+    if (savedSettings.fallbackSort === "name" || savedSettings.fallbackSort === "name-last") {
+      supportedSettings.fallbackSort = savedSettings.fallbackSort;
+    }
+    if (typeof savedSettings.persistOrderOnCreateDelete === "boolean") {
+      supportedSettings.persistOrderOnCreateDelete = savedSettings.persistOrderOnCreateDelete;
+    }
+    if (typeof savedSettings.enableDrag === "boolean") {
+      supportedSettings.enableDrag = savedSettings.enableDrag;
+    }
     const orderByFolder = saved?.orderByFolder && typeof saved.orderByFolder === "object"
       ? saved.orderByFolder
       : {};
@@ -137,12 +218,10 @@ export default class YqOrderDragPlugin extends Plugin {
     });
     return {
       version: 1,
-      settings: { ...DEFAULT_SETTINGS, ...savedSettings },
+      settings: { ...DEFAULT_SETTINGS, ...supportedSettings },
       orderByFolder,
       folderGuids: saved?.folderGuids && typeof saved.folderGuids === "object" ? saved.folderGuids : {},
-      manifestSignatures: saved?.manifestSignatures && typeof saved.manifestSignatures === "object"
-        ? saved.manifestSignatures
-        : {},
+      fileGuids: saved?.fileGuids && typeof saved.fileGuids === "object" ? saved.fileGuids : {},
     };
   }
 
@@ -171,7 +250,7 @@ export default class YqOrderDragPlugin extends Plugin {
 
   async reconcileVault(forceRefresh: boolean): Promise<void> {
     const all = this.app.vault.getAllLoadedFiles();
-    const files = all.filter((file): file is TFile => isMarkdown(file));
+    const files = all.filter((file): file is TFile => file instanceof TFile);
     const folders = all.filter((file): file is TFolder => file instanceof TFolder);
 
     // A snapshot that contains nothing but the root folder means the vault
@@ -182,33 +261,11 @@ export default class YqOrderDragPlugin extends Plugin {
     for (const file of files) await this.ensureFileGuid(file);
     for (const folder of folders) await this.ensureFolderGuid(folder);
 
-    const knownFolderPaths = new Set(folders.filter((folder) => folder.path).map((folder) => folder.path));
-    Object.keys(this.data.folderGuids).forEach((path) => {
-      if (!knownFolderPaths.has(path)) delete this.data.folderGuids[path];
-    });
-
-    const knownGuids = new Set<string>();
-    files.forEach((file) => {
-      const guid = this.guidByPath.get(file.path);
-      if (guid) knownGuids.add(guid);
-    });
-    folders.forEach((folder) => {
-      if (folder.path && this.data.folderGuids[folder.path]) knownGuids.add(this.data.folderGuids[folder.path]);
-    });
-    const knownFolderKeys = new Set([ROOT_FOLDER_KEY, ...knownGuids]);
-
-    Object.keys(this.data.orderByFolder).forEach((folderKey) => {
-      if (!knownFolderKeys.has(folderKey)) {
-        delete this.data.orderByFolder[folderKey];
-        return;
-      }
-      const next = uniqueKnownOrder(this.data.orderByFolder[folderKey] || [], knownGuids);
-      if (next.length) this.data.orderByFolder[folderKey] = next;
-      else delete this.data.orderByFolder[folderKey];
-    });
-
+    // Do not prune identities from a startup snapshot. On synced or large
+    // vaults, layoutReady can still precede the final wave of indexed files;
+    // pruning here would turn late arrivals into new bottom-placed items.
+    // Confirmed delete events perform the destructive cleanup instead.
     for (const folder of folders) this.reconcileFolder(folder);
-    if (this.data.settings.autoSeedFromManifest) await this.seedFromManifests(false);
     await this.flushSave();
     // The full scan also creates folder identities and initial order lists;
     // persist that reconciliation even when event persistence is disabled.
@@ -217,28 +274,29 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private reconcileFolder(folder: TFolder): void {
-    const sortable = folder.children.filter((child) => isMarkdown(child) || child instanceof TFolder);
+    const sortable = folder.children.filter((child) => child instanceof TFile || child instanceof TFolder);
     const childGuids = sortable.map((child) => this.getItemGuidSync(child)).filter((guid): guid is string => Boolean(guid));
     const uniqueChildGuids = [...new Set(childGuids)];
     const key = this.folderKeySync(folder);
     const previous = this.data.orderByFolder[key] || [];
-    const existing = previous.filter((guid) => uniqueChildGuids.includes(guid));
-    const missing = uniqueChildGuids.filter((guid) => !existing.includes(guid));
-    if (!previous.length) {
-      const byName = sortable.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
-      this.data.orderByFolder[key] = byName.map((child) => this.getItemGuidSync(child)).filter((guid): guid is string => Boolean(guid));
-    } else if (missing.length) {
-      this.data.orderByFolder[key] = this.data.settings.newItemPlacement === "top"
-        ? [...missing, ...existing]
-        : [...existing, ...missing];
-    } else {
-      this.data.orderByFolder[key] = existing;
-    }
+    const byName = sortable.slice()
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }))
+      .map((child) => this.getItemGuidSync(child))
+      .filter((guid): guid is string => Boolean(guid));
+    this.data.orderByFolder[key] = reconcileOrderNonDestructive(
+      previous, uniqueChildGuids, byName, this.data.settings.newItemPlacement,
+    );
   }
 
   private async ensureFileGuid(file: TFile): Promise<string> {
     const cached = this.guidByPath.get(file.path);
     if (cached) return cached;
+    if (!isMarkdown(file)) {
+      const guid = this.data.fileGuids[file.path] || createGuid("obs-file");
+      this.data.fileGuids[file.path] = guid;
+      this.guidByPath.set(file.path, guid);
+      return guid;
+    }
     const pending = this.guidPromises.get(file.path);
     if (pending) return pending;
 
@@ -304,8 +362,12 @@ export default class YqOrderDragPlugin extends Plugin {
     const siblingNotePath = `${folder.parent?.path ? `${folder.parent.path}/` : ""}${basename(folder.path)}.md`;
     const siblingNote = this.app.vault.getAbstractFileByPath(siblingNotePath);
     const folderNote = isMarkdown(ownNote) ? ownNote : siblingNote;
-    if (isMarkdown(folderNote)) {
+    if (folderNote instanceof TFile && isMarkdown(folderNote)) {
       const guid = await this.ensureFileGuid(folderNote);
+      const previousGuid = this.data.folderGuids[folder.path];
+      if (previousGuid && previousGuid !== guid) {
+        replaceGuidInOrders(this.data.orderByFolder, previousGuid, guid);
+      }
       this.data.folderGuids[folder.path] = guid;
       return guid;
     }
@@ -321,8 +383,10 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private getItemGuidSync(item: TAbstractFile): string | null {
-    if (isMarkdown(item)) {
-      return this.guidByPath.get(item.path) || this.readCachedFrontmatterGuid(item);
+    if (item instanceof TFile) {
+      return this.guidByPath.get(item.path)
+        || (isMarkdown(item) ? this.readCachedFrontmatterGuid(item) : this.data.fileGuids[item.path])
+        || null;
     }
     if (item instanceof TFolder) return this.data.folderGuids[item.path] || null;
     return null;
@@ -337,17 +401,13 @@ export default class YqOrderDragPlugin extends Plugin {
       : this.app.vault.getAbstractFileByPath(folderPath);
     const key = folder instanceof TFolder ? this.folderKeySync(folder) : ROOT_FOLDER_KEY;
     const saved = this.data.orderByFolder[key] || [];
-    const sortable = items.filter((item) => item instanceof TFolder || isMarkdown(item));
-    const unsupported = items.filter((item) => !(item instanceof TFolder || isMarkdown(item)));
-    return [
-      ...sortEntries(
+    const sortable = items.filter((item) => item instanceof TFolder || item instanceof TFile);
+    return sortEntries(
       sortable as SortableEntry[],
       saved,
       (item: any) => this.getItemGuidSync(item as TAbstractFile),
       this.data.settings.fallbackSort,
-      ),
-      ...unsupported,
-    ];
+    );
   }
 
   private async handleCreate(file: TAbstractFile): Promise<void> {
@@ -359,7 +419,7 @@ export default class YqOrderDragPlugin extends Plugin {
     // `reconcileVault()` below already scans every file/folder at startup,
     // so ignore vault events until the layout is ready.
     if (!this.app.workspace.layoutReady) return;
-    if (isMarkdown(file)) {
+    if (file instanceof TFile) {
       const guid = await this.ensureFileGuid(file);
       if (file.parent) await this.ensureFolderGuid(file.parent);
       this.addGuidToFolder(file.parent, guid);
@@ -368,23 +428,51 @@ export default class YqOrderDragPlugin extends Plugin {
       if (guid) this.addGuidToFolder(file.parent, guid);
     }
     this.queueSave();
-    if (this.data.settings.autoSeedFromManifest) await this.seedFromManifests(false);
     this.refreshExplorer();
   }
 
   private async handleDelete(file: TAbstractFile): Promise<void> {
     if (!this.app.workspace.layoutReady) return;
-    if (isMarkdown(file)) {
-      const guid = this.guidByPath.get(file.path) || this.readCachedFrontmatterGuid(file);
-      if (guid) removeGuidFromOrders(this.data.orderByFolder, guid);
+    if (file instanceof TFile) {
+      const guid = this.guidByPath.get(file.path)
+        || (isMarkdown(file) ? this.readCachedFrontmatterGuid(file) : this.data.fileGuids[file.path]);
+      const identityFolderPath = isMarkdown(file) && guid
+        ? folderIdentityPathForNote(file.path, this.data.folderGuids, guid)
+        : null;
+      if (guid && identityFolderPath) {
+        // The note disappeared, but its folder still owns this stable GUID.
+        // Keep the parent's reference and only remove a possible hidden
+        // self-entry from the folder's own child order.
+        detachFolderNoteFromOrder(this.data.orderByFolder, guid);
+      } else if (guid) {
+        removeGuidFromOrders(this.data.orderByFolder, guid);
+      }
       this.guidByPath.delete(file.path);
+      if (!isMarkdown(file)) delete this.data.fileGuids[file.path];
     } else if (file instanceof TFolder) {
       const prefix = `${file.path}/`;
-      const oldGuid = this.data.folderGuids[file.path];
+      const deletedFolderGuids = new Set<string>();
       Object.keys(this.data.folderGuids).forEach((path) => {
-        if (path === file.path || path.startsWith(prefix)) delete this.data.folderGuids[path];
+        if (path === file.path || path.startsWith(prefix)) {
+          const guid = this.data.folderGuids[path];
+          if (guid) deletedFolderGuids.add(guid);
+          delete this.data.folderGuids[path];
+        }
       });
-      if (oldGuid) delete this.data.orderByFolder[oldGuid];
+      // Do not rely on child delete events: Obsidian can report a deleted
+      // folder as one event, or report its descendants in either order.
+      const collectDescendantGuids = (item: TAbstractFile): void => {
+        if (item instanceof TFile) {
+          const guid = this.getItemGuidSync(item);
+          if (guid) deletedFolderGuids.add(guid);
+          this.guidByPath.delete(item.path);
+          if (!isMarkdown(item)) delete this.data.fileGuids[item.path];
+        } else if (item instanceof TFolder) {
+          item.children.forEach(collectDescendantGuids);
+        }
+      };
+      file.children.forEach(collectDescendantGuids);
+      purgeFolderGuidsFromOrders(this.data.orderByFolder, deletedFolderGuids);
     }
     this.queueSave();
     this.refreshExplorer();
@@ -393,23 +481,34 @@ export default class YqOrderDragPlugin extends Plugin {
   private async handleRename(file: TAbstractFile, oldPath: string): Promise<void> {
     if (!this.app.workspace.layoutReady) return;
     if (file instanceof TFolder) {
-      const prefix = `${oldPath}/`;
-      const updates: Array<[string, string, string]> = [];
-      Object.entries(this.data.folderGuids).forEach(([path, guid]) => {
-        if (path === oldPath || path.startsWith(prefix)) {
-          const nextPath = path === oldPath ? file.path : `${file.path}${path.slice(oldPath.length)}`;
-          updates.push([path, nextPath, guid]);
-        }
+      const movedGuid = this.data.folderGuids[oldPath];
+      const oldParent = parentPath(oldPath);
+      migratePathMappings(this.data.folderGuids, oldPath, file.path);
+      const fileUpdates = migratePathMappings(this.data.fileGuids, oldPath, file.path);
+      fileUpdates.forEach(([from, to, guid]) => {
+        this.guidByPath.delete(from);
+        this.guidByPath.set(to, guid);
       });
-      updates.forEach(([from, to, guid]) => {
-        delete this.data.folderGuids[from];
-        this.data.folderGuids[to] = guid;
-      });
-    } else if (isMarkdown(file)) {
-      const guid = this.guidByPath.get(oldPath) || this.readCachedFrontmatterGuid(file);
+      const newParent = file.parent?.path || "";
+      if (movedGuid && oldParent !== newParent) {
+        if (file.parent) await this.ensureFolderGuid(file.parent);
+        relocateGuid(
+          this.data.orderByFolder,
+          this.folderKeySync(file.parent),
+          movedGuid,
+          this.data.settings.newItemPlacement,
+        );
+      }
+    } else if (file instanceof TFile) {
+      const guid = this.guidByPath.get(oldPath)
+        || (isMarkdown(file) ? this.readCachedFrontmatterGuid(file) : this.data.fileGuids[oldPath]);
       this.guidByPath.delete(oldPath);
       if (guid) {
         this.guidByPath.set(file.path, guid);
+        if (!isMarkdown(file)) {
+          delete this.data.fileGuids[oldPath];
+          this.data.fileGuids[file.path] = guid;
+        }
         const oldParent = parentPath(oldPath);
         const newParent = file.parent?.path || "";
         if (oldParent !== newParent) {
@@ -423,30 +522,148 @@ export default class YqOrderDragPlugin extends Plugin {
     this.refreshExplorer();
   }
 
-  private async handleModify(file: TAbstractFile): Promise<void> {
-    if (!this.app.workspace.layoutReady) return;
-    if (file instanceof TFile && basename(file.path) === MANIFEST_NAME) {
-      if (this.data.settings.autoSeedFromManifest) await this.seedFromManifests(false);
-    }
-  }
-
   private addGuidToFolder(folder: TFolder | null, guid: string): void {
     const key = this.folderKeySync(folder);
     const order = this.data.orderByFolder[key] || [];
-    if (order.includes(guid)) return;
-    this.data.orderByFolder[key] = this.data.settings.newItemPlacement === "top"
-      ? [guid, ...order]
-      : [...order, guid];
+    this.data.orderByFolder[key] = insertGuid(order, guid, this.data.settings.newItemPlacement);
   }
 
-  async seedFromManifests(force: boolean): Promise<void> {
-    await this.seedFromManifestsInternal(force);
-  }
-
-  private async seedFromManifestsInternal(force: boolean): Promise<void> {
+  async requestManifestImport(): Promise<void> {
     const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
     if (!manifests.length) {
-      if (force) new Notice("未找到 _yuque_order.json");
+      new Notice("未找到 _yuque_order.json");
+      return;
+    }
+    const report = await this.inspectManifestConsistency(manifests);
+    if (manifestIssueCount(report) > 0) {
+      const proceed = await new Promise<boolean>((resolve) => {
+        new ManifestImportConfirmModal(this.app, report, resolve).open();
+      });
+      if (!proceed) {
+        new Notice("已放弃导入语雀顺序清单");
+        return;
+      }
+    }
+    this.manifestNoticeShown = false;
+    await this.seedFromManifests();
+  }
+
+  private async inspectManifestConsistency(manifests: TFile[]): Promise<ManifestCheckReport> {
+    const report: ManifestCheckReport = {
+      missing: [],
+      extra: [],
+      moved: [],
+      duplicateManifestGuids: [],
+      duplicateActualGuids: [],
+      invalidManifests: [],
+    };
+    const all = this.app.vault.getAllLoadedFiles();
+    const byGuid = new Map<string, TAbstractFile>();
+    const folderByGuid = new Map<string, TFolder>();
+    all.forEach((item) => {
+      const guid = this.getItemGuidSync(item);
+      if (!guid) return;
+      if (item instanceof TFolder) folderByGuid.set(guid, item);
+      else if (item instanceof TFile) byGuid.set(guid, item);
+    });
+
+    for (const manifestFile of manifests) {
+      let raw: any;
+      try {
+        raw = JSON.parse(await this.app.vault.read(manifestFile));
+      } catch {
+        report.invalidManifests.push(`${manifestFile.path}：JSON 无法解析`);
+        continue;
+      }
+      if (raw?.version !== 1 || !Array.isArray(raw.tree)) {
+        report.invalidManifests.push(`${manifestFile.path}：版本或 tree 格式无效`);
+        continue;
+      }
+
+      const manifestEntries: InventoryEntry[] = [];
+      const manifestGuids: string[] = [];
+      const collect = (nodes: any[], parentGuid: string, trail: string): void => {
+        nodes.forEach((node) => {
+          const guid = normalizeGuid(node?.guid);
+          if (!guid) return;
+          const title = String(node?.title || guid);
+          const label = trail ? `${trail}/${title}` : `${manifestFile.parent?.path || ""}/${title}`;
+          manifestEntries.push({ guid, parentGuid, label });
+          manifestGuids.push(guid);
+          if (Array.isArray(node?.children)) collect(node.children, guid, label);
+        });
+      };
+      collect(raw.tree, ROOT_FOLDER_KEY, "");
+
+      // Resolve empty-body parent folders by name without changing plugin data.
+      const folderAliases = new Map<string, string>();
+      const adoptedFolderPaths = new Set<string>();
+      const manifestGuidSet = new Set(manifestGuids);
+      const resolveTree = (nodes: any[], fallbackFolder: TFolder | null): void => {
+        nodes.forEach((node) => {
+          const guid = normalizeGuid(node?.guid);
+          if (!guid) return;
+          let item = byGuid.get(guid) || folderByGuid.get(guid) || null;
+          if (!item) {
+            const folder = this.matchManifestNodeToFolder(
+              fallbackFolder, node, adoptedFolderPaths, manifestGuidSet,
+            );
+            if (folder) {
+              folderAliases.set(folder.path, guid);
+              folderByGuid.set(guid, folder);
+              item = folder;
+            }
+          }
+          const logicalItem = folderByGuid.get(guid)
+            || (item instanceof TFile ? this.findFolderForNote(item) : null)
+            || item;
+          const childFolder = logicalItem instanceof TFolder
+            ? logicalItem
+            : logicalItem?.parent || fallbackFolder;
+          if (Array.isArray(node?.children)) resolveTree(node.children, childFolder);
+        });
+      };
+      resolveTree(raw.tree, manifestFile.parent);
+
+      const logicalItems = new Map<string, TAbstractFile>();
+      const rootPath = manifestFile.parent?.path || "";
+      const prefix = rootPath ? `${rootPath}/` : "";
+      all.forEach((item) => {
+        if (!(item instanceof TFolder || item instanceof TFile)) return;
+        if (item === manifestFile || item.path === rootPath) return;
+        if (prefix && !item.path.startsWith(prefix)) return;
+        const guid = this.getItemGuidSync(item);
+        if (!guid) return;
+        let logicalItem: TAbstractFile = item;
+        if (item instanceof TFile && isMarkdown(item)) {
+          const ownFolder = item.parent && item.basename === item.parent.name ? item.parent : null;
+          logicalItem = ownFolder || this.findFolderForNote(item) || item;
+        }
+        logicalItems.set(logicalItem.path, logicalItem);
+      });
+      const actualEntries: InventoryEntry[] = [...logicalItems.values()].map((item) => {
+        const originalGuid = this.getItemGuidSync(item) || `path:${item.path}`;
+        const guid = folderAliases.get(item.path) || originalGuid;
+        const parent = item.parent;
+        const parentGuid = !parent || parent.path === rootPath
+          ? ROOT_FOLDER_KEY
+          : folderAliases.get(parent.path) || this.getItemGuidSync(parent) || `path:${parent.path}`;
+        return { guid, parentGuid, label: item.path };
+      });
+      const comparison = compareInventories(manifestEntries, actualEntries);
+      report.missing.push(...comparison.missing);
+      report.extra.push(...comparison.extra);
+      report.moved.push(...comparison.moved);
+      report.duplicateManifestGuids.push(...comparison.duplicateManifestGuids);
+      report.duplicateActualGuids.push(...comparison.duplicateActualGuids);
+    }
+    return report;
+  }
+
+  private async seedFromManifests(): Promise<void> {
+    const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
+    if (!manifests.length) {
+      new Notice("未找到 _yuque_order.json");
       return;
     }
 
@@ -457,7 +674,7 @@ export default class YqOrderDragPlugin extends Plugin {
       const guid = this.getItemGuidSync(item);
       if (!guid) return;
       if (item instanceof TFolder) folderByGuid.set(guid, item);
-      else if (isMarkdown(item)) byGuid.set(guid, item);
+      else if (item instanceof TFile) byGuid.set(guid, item);
     });
 
     let seeded = 0;
@@ -473,9 +690,6 @@ export default class YqOrderDragPlugin extends Plugin {
         continue;
       }
       if (raw?.version !== 1 || !Array.isArray(raw.tree)) continue;
-      // Include the folder-note interpretation in the signature so an upgrade
-      // from the original V1 seeding logic repairs already persisted orders.
-      const signature = `logical-folder-note-v3:${raw.generatedAt || ""}:${text.length}:${text.slice(0, 80)}`;
       const manifestGuids: string[] = [];
       const collectGuids = (nodes: any[]) => nodes.forEach((node) => {
         const guid = normalizeGuid(node?.guid);
@@ -483,8 +697,6 @@ export default class YqOrderDragPlugin extends Plugin {
         if (Array.isArray(node?.children)) collectGuids(node.children);
       });
       collectGuids(raw.tree);
-      const hasUnmatchedItems = manifestGuids.some((guid) => !byGuid.has(guid) && !folderByGuid.has(guid));
-      if (!force && this.data.manifestSignatures[manifestFile.path] === signature && !hasUnmatchedItems) continue;
 
       const desired = new Map<string, string[]>();
       const append = (key: string, guid: string) => {
@@ -513,8 +725,7 @@ export default class YqOrderDragPlugin extends Plugin {
               if (Array.isArray(node.children) && node.children.length) visit(node.children, folder);
               return;
             }
-            // Do not persist manifest-only identities before their files arrive;
-            // a later create event will retry seeding once the item exists.
+            // Do not persist manifest-only identities when their files do not exist.
             if (Array.isArray(node.children) && node.children.length) visit(node.children, fallbackFolder);
             return;
           }
@@ -553,23 +764,18 @@ export default class YqOrderDragPlugin extends Plugin {
           seeded += 1;
         }
       });
-      this.data.manifestSignatures[manifestFile.path] = signature;
     }
 
     if (seeded) {
       await this.flushSave();
       await this.saveData(this.data);
       this.refreshExplorer();
-      // Manual (command/setting button) imports always report back; automatic
-      // ones report at most once per session so opening the vault with many
-      // manifests does not stack one Notice per file.
-      if (force || !this.autoSeedNoticeShown) {
-        this.autoSeedNoticeShown = true;
-        new Notice("已从语雀清单导入顺序");
+      new Notice("已从语雀清单导入顺序");
+    } else {
+      if (!this.manifestNoticeShown) {
+        this.manifestNoticeShown = true;
+        new Notice("顺序清单没有可匹配的文档，已保留现有顺序");
       }
-    } else if (force && !this.manifestNoticeShown) {
-      this.manifestNoticeShown = true;
-      new Notice("顺序清单没有可匹配的文档，已保留现有顺序");
     }
   }
 
@@ -812,7 +1018,7 @@ export default class YqOrderDragPlugin extends Plugin {
     if (!sourceGuid || !targetGuid || !source.parent) return;
     const key = this.folderKeySync(source.parent);
     const fallbackOrder = source.parent.children
-      .filter((child) => child instanceof TFolder || isMarkdown(child))
+      .filter((child) => child instanceof TFolder || child instanceof TFile)
       .map((child) => this.getItemGuidSync(child))
       .filter((guid): guid is string => Boolean(guid));
     const currentOrder = this.data.orderByFolder[key]?.length
@@ -944,13 +1150,6 @@ class YqOrderSettingTab extends PluginSettingTab {
           this.plugin.refreshExplorer();
         }));
     new Setting(containerEl)
-      .setName("自动导入语雀清单")
-      .setDesc("检测到新的或更新过的 _yuque_order.json 时自动播种；不会在每次启动时覆盖已拖拽顺序。")
-      .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.autoSeedFromManifest).onChange(async (value) => {
-        this.plugin.data.settings.autoSeedFromManifest = value;
-        await this.plugin.saveSettings();
-      }));
-    new Setting(containerEl)
       .setName("增删后立即持久化")
       .setDesc("关闭可减少 Obsidian Sync 冲突；拖拽排序仍会保存。")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.persistOrderOnCreateDelete).onChange(async (value) => {
@@ -966,7 +1165,7 @@ class YqOrderSettingTab extends PluginSettingTab {
       }));
     new Setting(containerEl)
       .setName("手动导入/重同步")
-      .setDesc("按当前 vault 中的 _yuque_order.json 强制恢复语雀目录顺序。")
-      .addButton((button) => button.setButtonText("立即导入").onClick(() => void this.plugin.seedFromManifests(true)));
+      .setDesc("先核对当前库与清单；一致时直接导入，不一致时由你确认是否继续。")
+      .addButton((button) => button.setButtonText("检查并导入").onClick(() => void this.plugin.requestManifestImport()));
   }
 }

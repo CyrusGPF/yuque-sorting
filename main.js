@@ -65,13 +65,14 @@ function sortEntries(entries, savedOrder, guidOf, fallback = "name-last") {
     return a.originalIndex - b.originalIndex;
   }).map(({ entry }) => entry);
 }
-function uniqueKnownOrder(order, knownGuids) {
-  const seen = /* @__PURE__ */ new Set();
-  return order.filter((guid) => {
-    if (!knownGuids.has(guid) || seen.has(guid)) return false;
-    seen.add(guid);
-    return true;
-  });
+function reconcileOrderNonDestructive(previousOrder, currentChildGuids, initialSortedGuids, placement) {
+  const previous = [...new Set(previousOrder)];
+  const current = [...new Set(currentChildGuids)];
+  if (!previous.length) return [...new Set(initialSortedGuids)];
+  const known = new Set(previous);
+  const missing = current.filter((guid) => !known.has(guid));
+  if (!missing.length) return previous;
+  return placement === "top" ? [...missing, ...previous] : [...previous, ...missing];
 }
 function moveGuid(order, sourceGuid, targetGuid, insertBefore) {
   const next = order.filter((guid) => guid !== sourceGuid);
@@ -95,6 +96,116 @@ function removeGuidFromOrders(orderByFolder, guid) {
   });
   return changed;
 }
+function insertGuid(order, guid, placement) {
+  if (order.includes(guid)) return order;
+  return placement === "top" ? [guid, ...order] : [...order, guid];
+}
+function relocateGuid(orderByFolder, targetFolderKey, guid, placement) {
+  removeGuidFromOrders(orderByFolder, guid);
+  orderByFolder[targetFolderKey] = insertGuid(
+    orderByFolder[targetFolderKey] || [],
+    guid,
+    placement
+  );
+}
+function replaceGuidInOrders(orderByFolder, oldGuid, newGuid) {
+  if (!oldGuid || !newGuid || oldGuid === newGuid) return false;
+  let changed = false;
+  Object.keys(orderByFolder).forEach((folderKey) => {
+    const oldOrder = orderByFolder[folderKey] || [];
+    const seen = /* @__PURE__ */ new Set();
+    const nextOrder = oldOrder.map((guid) => guid === oldGuid ? newGuid : guid).filter((guid) => {
+      if (seen.has(guid)) return false;
+      seen.add(guid);
+      return true;
+    });
+    if (nextOrder.length !== oldOrder.length || nextOrder.some((guid, index) => guid !== oldOrder[index])) {
+      orderByFolder[folderKey] = nextOrder;
+      changed = true;
+    }
+  });
+  if (Object.prototype.hasOwnProperty.call(orderByFolder, oldGuid)) {
+    const oldChildren = orderByFolder[oldGuid] || [];
+    const newChildren = orderByFolder[newGuid] || [];
+    orderByFolder[newGuid] = [.../* @__PURE__ */ new Set([...oldChildren, ...newChildren])];
+    delete orderByFolder[oldGuid];
+    changed = true;
+  }
+  return changed;
+}
+function folderIdentityPathForNote(notePath, folderGuids, guid) {
+  const withoutExtension = notePath.replace(/\.md$/i, "");
+  const slash = notePath.lastIndexOf("/");
+  const parent = slash < 0 ? "" : notePath.slice(0, slash);
+  const noteName = withoutExtension.slice(withoutExtension.lastIndexOf("/") + 1);
+  const parentName = parent.slice(parent.lastIndexOf("/") + 1);
+  const candidates = noteName === parentName ? [parent, withoutExtension] : [withoutExtension];
+  return candidates.find((path) => path && folderGuids[path] === guid) || null;
+}
+function detachFolderNoteFromOrder(orderByFolder, folderGuid) {
+  const ownedOrder = orderByFolder[folderGuid];
+  if (!ownedOrder) return false;
+  const next = ownedOrder.filter((guid) => guid !== folderGuid);
+  if (next.length === ownedOrder.length) return false;
+  orderByFolder[folderGuid] = next;
+  return true;
+}
+function migratePathMappings(mappings, oldPath, newPath) {
+  const prefix = `${oldPath}/`;
+  const updates = [];
+  Object.entries(mappings).forEach(([path, guid]) => {
+    if (path === oldPath || path.startsWith(prefix)) {
+      const nextPath = path === oldPath ? newPath : `${newPath}${path.slice(oldPath.length)}`;
+      updates.push([path, nextPath, guid]);
+    }
+  });
+  updates.forEach(([from, to, guid]) => {
+    delete mappings[from];
+    mappings[to] = guid;
+  });
+  return updates;
+}
+function purgeFolderGuidsFromOrders(orderByFolder, guids) {
+  const deleted = new Set(guids);
+  if (!deleted.size) return false;
+  let changed = false;
+  Object.keys(orderByFolder).forEach((folderKey) => {
+    if (deleted.has(folderKey)) {
+      delete orderByFolder[folderKey];
+      changed = true;
+      return;
+    }
+    const oldOrder = orderByFolder[folderKey] || [];
+    const nextOrder = oldOrder.filter((guid) => !deleted.has(guid));
+    if (nextOrder.length !== oldOrder.length) {
+      orderByFolder[folderKey] = nextOrder;
+      changed = true;
+    }
+  });
+  return changed;
+}
+function compareInventories(manifestEntries, actualEntries) {
+  const groupByGuid = (entries) => {
+    const grouped = /* @__PURE__ */ new Map();
+    entries.forEach((entry) => grouped.set(entry.guid, [...grouped.get(entry.guid) || [], entry]));
+    return grouped;
+  };
+  const manifestByGuid = groupByGuid(manifestEntries);
+  const actualByGuid = groupByGuid(actualEntries);
+  const duplicateManifestGuids = [...manifestByGuid].filter(([, entries]) => entries.length > 1).map(([guid]) => guid);
+  const duplicateActualGuids = [...actualByGuid].filter(([, entries]) => entries.length > 1).map(([guid]) => guid);
+  const missing = manifestEntries.filter((entry) => !actualByGuid.has(entry.guid));
+  const extra = actualEntries.filter((entry) => !manifestByGuid.has(entry.guid));
+  const moved = [];
+  manifestByGuid.forEach((expectedEntries, guid) => {
+    const actualEntriesForGuid = actualByGuid.get(guid);
+    if (expectedEntries.length !== 1 || (actualEntriesForGuid == null ? void 0 : actualEntriesForGuid.length) !== 1) return;
+    const expected = expectedEntries[0];
+    const actual = actualEntriesForGuid[0];
+    if (expected.parentGuid !== actual.parentGuid) moved.push({ expected, actual });
+  });
+  return { missing, extra, moved, duplicateManifestGuids, duplicateActualGuids };
+}
 
 // main.ts
 var MANIFEST_NAME = "_yuque_order.json";
@@ -102,7 +213,6 @@ var DEFAULT_SETTINGS = {
   orderFrontmatterKey: "guid",
   newItemPlacement: "bottom",
   fallbackSort: "name-last",
-  autoSeedFromManifest: true,
   persistOrderOnCreateDelete: true,
   enableDrag: true
 };
@@ -125,6 +235,49 @@ function createGuid(prefix = "obs") {
   const uuid = (_b = (_a = globalThis.crypto) == null ? void 0 : _a.randomUUID) == null ? void 0 : _b.call(_a);
   return `${prefix}-${uuid || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
 }
+function manifestIssueCount(report) {
+  return report.missing.length + report.extra.length + report.moved.length + report.duplicateManifestGuids.length + report.duplicateActualGuids.length + report.invalidManifests.length;
+}
+var ManifestImportConfirmModal = class extends import_obsidian.Modal {
+  constructor(app, report, resolveChoice) {
+    super(app);
+    this.report = report;
+    this.resolveChoice = resolveChoice;
+    this.settled = false;
+  }
+  onOpen() {
+    this.setTitle("\u8BED\u96C0\u987A\u5E8F\u6E05\u5355\u4E0E\u5F53\u524D\u5E93\u4E0D\u4E00\u81F4");
+    this.contentEl.createEl("p", {
+      text: "\u7EE7\u7EED\u5BFC\u5165\u53EA\u4F1A\u8C03\u6574\u80FD\u591F\u5339\u914D\u7684\u9879\u76EE\u987A\u5E8F\uFF0C\u4E0D\u4F1A\u521B\u5EFA\u3001\u5220\u9664\u6216\u79FB\u52A8\u6587\u4EF6\u3002\u8BF7\u786E\u8BA4\u662F\u5426\u7EE7\u7EED\u3002"
+    });
+    const groups = [
+      ["\u6E05\u5355\u4E2D\u6709\u3001\u5F53\u524D\u5E93\u7F3A\u5931", this.report.missing.map((entry) => entry.label)],
+      ["\u5F53\u524D\u5E93\u591A\u51FA\u7684\u9879\u76EE", this.report.extra.map((entry) => entry.label)],
+      ["\u6240\u5728\u76EE\u5F55\u4E0E\u6E05\u5355\u4E0D\u7B26", this.report.moved.map(({ actual }) => actual.label)],
+      ["\u6E05\u5355\u4E2D\u7684\u91CD\u590D GUID", this.report.duplicateManifestGuids],
+      ["\u5F53\u524D\u5E93\u4E2D\u7684\u91CD\u590D GUID", this.report.duplicateActualGuids],
+      ["\u65E0\u6CD5\u8BFB\u53D6\u7684\u6E05\u5355", this.report.invalidManifests]
+    ];
+    groups.forEach(([title, items]) => {
+      if (!items.length) return;
+      this.contentEl.createEl("h4", { text: `${title}\uFF08${items.length}\uFF09` });
+      const list = this.contentEl.createEl("ul");
+      items.slice(0, 8).forEach((item) => list.createEl("li", { text: item }));
+      if (items.length > 8) list.createEl("li", { text: `\u53E6\u6709 ${items.length - 8} \u9879\u2026\u2026` });
+    });
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("\u653E\u5F03").onClick(() => this.finish(false))).addButton((button) => button.setButtonText("\u4ECD\u7136\u5BFC\u5165").setWarning().onClick(() => this.finish(true)));
+  }
+  onClose() {
+    this.contentEl.empty();
+    if (!this.settled) this.resolveChoice(false);
+  }
+  finish(choice) {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolveChoice(choice);
+    this.close();
+  }
+};
 var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
@@ -137,7 +290,6 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.domOrderFrame = null;
     this.explorerSetup = false;
     this.manifestNoticeShown = false;
-    this.autoSeedNoticeShown = false;
     this.dragSourcePath = "";
   }
   async onload() {
@@ -145,11 +297,10 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleRename(file, oldPath)));
-    this.registerEvent(this.app.vault.on("modify", (file) => void this.handleModify(file)));
     this.addCommand({
       id: "import-yuque-order-manifest",
       name: "\u5BFC\u5165/\u91CD\u540C\u6B65\u8BED\u96C0\u987A\u5E8F\u6E05\u5355",
-      callback: () => void this.seedFromManifests(true)
+      callback: () => void this.requestManifestImport()
     });
     this.addCommand({
       id: "refresh-yuque-order",
@@ -173,16 +324,32 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   }
   normalizeData(saved) {
     const savedSettings = (saved == null ? void 0 : saved.settings) || {};
+    const supportedSettings = {};
+    if (typeof savedSettings.orderFrontmatterKey === "string") {
+      supportedSettings.orderFrontmatterKey = savedSettings.orderFrontmatterKey;
+    }
+    if (savedSettings.newItemPlacement === "top" || savedSettings.newItemPlacement === "bottom") {
+      supportedSettings.newItemPlacement = savedSettings.newItemPlacement;
+    }
+    if (savedSettings.fallbackSort === "name" || savedSettings.fallbackSort === "name-last") {
+      supportedSettings.fallbackSort = savedSettings.fallbackSort;
+    }
+    if (typeof savedSettings.persistOrderOnCreateDelete === "boolean") {
+      supportedSettings.persistOrderOnCreateDelete = savedSettings.persistOrderOnCreateDelete;
+    }
+    if (typeof savedSettings.enableDrag === "boolean") {
+      supportedSettings.enableDrag = savedSettings.enableDrag;
+    }
     const orderByFolder = (saved == null ? void 0 : saved.orderByFolder) && typeof saved.orderByFolder === "object" ? saved.orderByFolder : {};
     Object.keys(orderByFolder).forEach((key) => {
       if (!Array.isArray(orderByFolder[key])) orderByFolder[key] = [];
     });
     return {
       version: 1,
-      settings: { ...DEFAULT_SETTINGS, ...savedSettings },
+      settings: { ...DEFAULT_SETTINGS, ...supportedSettings },
       orderByFolder,
       folderGuids: (saved == null ? void 0 : saved.folderGuids) && typeof saved.folderGuids === "object" ? saved.folderGuids : {},
-      manifestSignatures: (saved == null ? void 0 : saved.manifestSignatures) && typeof saved.manifestSignatures === "object" ? saved.manifestSignatures : {}
+      fileGuids: (saved == null ? void 0 : saved.fileGuids) && typeof saved.fileGuids === "object" ? saved.fileGuids : {}
     };
   }
   queueSave(force = false) {
@@ -207,59 +374,39 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   }
   async reconcileVault(forceRefresh) {
     const all = this.app.vault.getAllLoadedFiles();
-    const files = all.filter((file) => isMarkdown(file));
+    const files = all.filter((file) => file instanceof import_obsidian.TFile);
     const folders = all.filter((file) => file instanceof import_obsidian.TFolder);
     if (all.length <= 1) return;
     for (const file of files) await this.ensureFileGuid(file);
     for (const folder of folders) await this.ensureFolderGuid(folder);
-    const knownFolderPaths = new Set(folders.filter((folder) => folder.path).map((folder) => folder.path));
-    Object.keys(this.data.folderGuids).forEach((path) => {
-      if (!knownFolderPaths.has(path)) delete this.data.folderGuids[path];
-    });
-    const knownGuids = /* @__PURE__ */ new Set();
-    files.forEach((file) => {
-      const guid = this.guidByPath.get(file.path);
-      if (guid) knownGuids.add(guid);
-    });
-    folders.forEach((folder) => {
-      if (folder.path && this.data.folderGuids[folder.path]) knownGuids.add(this.data.folderGuids[folder.path]);
-    });
-    const knownFolderKeys = /* @__PURE__ */ new Set([ROOT_FOLDER_KEY, ...knownGuids]);
-    Object.keys(this.data.orderByFolder).forEach((folderKey) => {
-      if (!knownFolderKeys.has(folderKey)) {
-        delete this.data.orderByFolder[folderKey];
-        return;
-      }
-      const next = uniqueKnownOrder(this.data.orderByFolder[folderKey] || [], knownGuids);
-      if (next.length) this.data.orderByFolder[folderKey] = next;
-      else delete this.data.orderByFolder[folderKey];
-    });
     for (const folder of folders) this.reconcileFolder(folder);
-    if (this.data.settings.autoSeedFromManifest) await this.seedFromManifests(false);
     await this.flushSave();
     await this.saveData(this.data);
     if (forceRefresh) this.refreshExplorer();
   }
   reconcileFolder(folder) {
-    const sortable = folder.children.filter((child) => isMarkdown(child) || child instanceof import_obsidian.TFolder);
+    const sortable = folder.children.filter((child) => child instanceof import_obsidian.TFile || child instanceof import_obsidian.TFolder);
     const childGuids = sortable.map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
     const uniqueChildGuids = [...new Set(childGuids)];
     const key = this.folderKeySync(folder);
     const previous = this.data.orderByFolder[key] || [];
-    const existing = previous.filter((guid) => uniqueChildGuids.includes(guid));
-    const missing = uniqueChildGuids.filter((guid) => !existing.includes(guid));
-    if (!previous.length) {
-      const byName = sortable.slice().sort((a, b) => a.name.localeCompare(b.name, void 0, { numeric: true, sensitivity: "base" }));
-      this.data.orderByFolder[key] = byName.map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
-    } else if (missing.length) {
-      this.data.orderByFolder[key] = this.data.settings.newItemPlacement === "top" ? [...missing, ...existing] : [...existing, ...missing];
-    } else {
-      this.data.orderByFolder[key] = existing;
-    }
+    const byName = sortable.slice().sort((a, b) => a.name.localeCompare(b.name, void 0, { numeric: true, sensitivity: "base" })).map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
+    this.data.orderByFolder[key] = reconcileOrderNonDestructive(
+      previous,
+      uniqueChildGuids,
+      byName,
+      this.data.settings.newItemPlacement
+    );
   }
   async ensureFileGuid(file) {
     const cached = this.guidByPath.get(file.path);
     if (cached) return cached;
+    if (!isMarkdown(file)) {
+      const guid = this.data.fileGuids[file.path] || createGuid("obs-file");
+      this.data.fileGuids[file.path] = guid;
+      this.guidByPath.set(file.path, guid);
+      return guid;
+    }
     const pending = this.guidPromises.get(file.path);
     if (pending) return pending;
     const promise = (async () => {
@@ -324,8 +471,12 @@ ${text}`;
     const siblingNotePath = `${((_a = folder.parent) == null ? void 0 : _a.path) ? `${folder.parent.path}/` : ""}${basename(folder.path)}.md`;
     const siblingNote = this.app.vault.getAbstractFileByPath(siblingNotePath);
     const folderNote = isMarkdown(ownNote) ? ownNote : siblingNote;
-    if (isMarkdown(folderNote)) {
+    if (folderNote instanceof import_obsidian.TFile && isMarkdown(folderNote)) {
       const guid = await this.ensureFileGuid(folderNote);
+      const previousGuid = this.data.folderGuids[folder.path];
+      if (previousGuid && previousGuid !== guid) {
+        replaceGuidInOrders(this.data.orderByFolder, previousGuid, guid);
+      }
       this.data.folderGuids[folder.path] = guid;
       return guid;
     }
@@ -339,8 +490,8 @@ ${text}`;
     return this.data.folderGuids[folder.path] || ROOT_FOLDER_KEY;
   }
   getItemGuidSync(item) {
-    if (isMarkdown(item)) {
-      return this.guidByPath.get(item.path) || this.readCachedFrontmatterGuid(item);
+    if (item instanceof import_obsidian.TFile) {
+      return this.guidByPath.get(item.path) || (isMarkdown(item) ? this.readCachedFrontmatterGuid(item) : this.data.fileGuids[item.path]) || null;
     }
     if (item instanceof import_obsidian.TFolder) return this.data.folderGuids[item.path] || null;
     return null;
@@ -349,21 +500,17 @@ ${text}`;
     const folder = !folderPath || folderPath === "/" ? this.app.vault.getRoot() : this.app.vault.getAbstractFileByPath(folderPath);
     const key = folder instanceof import_obsidian.TFolder ? this.folderKeySync(folder) : ROOT_FOLDER_KEY;
     const saved = this.data.orderByFolder[key] || [];
-    const sortable = items.filter((item) => item instanceof import_obsidian.TFolder || isMarkdown(item));
-    const unsupported = items.filter((item) => !(item instanceof import_obsidian.TFolder || isMarkdown(item)));
-    return [
-      ...sortEntries(
-        sortable,
-        saved,
-        (item) => this.getItemGuidSync(item),
-        this.data.settings.fallbackSort
-      ),
-      ...unsupported
-    ];
+    const sortable = items.filter((item) => item instanceof import_obsidian.TFolder || item instanceof import_obsidian.TFile);
+    return sortEntries(
+      sortable,
+      saved,
+      (item) => this.getItemGuidSync(item),
+      this.data.settings.fallbackSort
+    );
   }
   async handleCreate(file) {
     if (!this.app.workspace.layoutReady) return;
-    if (isMarkdown(file)) {
+    if (file instanceof import_obsidian.TFile) {
       const guid = await this.ensureFileGuid(file);
       if (file.parent) await this.ensureFolderGuid(file.parent);
       this.addGuidToFolder(file.parent, guid);
@@ -372,49 +519,79 @@ ${text}`;
       if (guid) this.addGuidToFolder(file.parent, guid);
     }
     this.queueSave();
-    if (this.data.settings.autoSeedFromManifest) await this.seedFromManifests(false);
     this.refreshExplorer();
   }
   async handleDelete(file) {
     if (!this.app.workspace.layoutReady) return;
-    if (isMarkdown(file)) {
-      const guid = this.guidByPath.get(file.path) || this.readCachedFrontmatterGuid(file);
-      if (guid) removeGuidFromOrders(this.data.orderByFolder, guid);
+    if (file instanceof import_obsidian.TFile) {
+      const guid = this.guidByPath.get(file.path) || (isMarkdown(file) ? this.readCachedFrontmatterGuid(file) : this.data.fileGuids[file.path]);
+      const identityFolderPath = isMarkdown(file) && guid ? folderIdentityPathForNote(file.path, this.data.folderGuids, guid) : null;
+      if (guid && identityFolderPath) {
+        detachFolderNoteFromOrder(this.data.orderByFolder, guid);
+      } else if (guid) {
+        removeGuidFromOrders(this.data.orderByFolder, guid);
+      }
       this.guidByPath.delete(file.path);
+      if (!isMarkdown(file)) delete this.data.fileGuids[file.path];
     } else if (file instanceof import_obsidian.TFolder) {
       const prefix = `${file.path}/`;
-      const oldGuid = this.data.folderGuids[file.path];
+      const deletedFolderGuids = /* @__PURE__ */ new Set();
       Object.keys(this.data.folderGuids).forEach((path) => {
-        if (path === file.path || path.startsWith(prefix)) delete this.data.folderGuids[path];
+        if (path === file.path || path.startsWith(prefix)) {
+          const guid = this.data.folderGuids[path];
+          if (guid) deletedFolderGuids.add(guid);
+          delete this.data.folderGuids[path];
+        }
       });
-      if (oldGuid) delete this.data.orderByFolder[oldGuid];
+      const collectDescendantGuids = (item) => {
+        if (item instanceof import_obsidian.TFile) {
+          const guid = this.getItemGuidSync(item);
+          if (guid) deletedFolderGuids.add(guid);
+          this.guidByPath.delete(item.path);
+          if (!isMarkdown(item)) delete this.data.fileGuids[item.path];
+        } else if (item instanceof import_obsidian.TFolder) {
+          item.children.forEach(collectDescendantGuids);
+        }
+      };
+      file.children.forEach(collectDescendantGuids);
+      purgeFolderGuidsFromOrders(this.data.orderByFolder, deletedFolderGuids);
     }
     this.queueSave();
     this.refreshExplorer();
   }
   async handleRename(file, oldPath) {
-    var _a;
+    var _a, _b;
     if (!this.app.workspace.layoutReady) return;
     if (file instanceof import_obsidian.TFolder) {
-      const prefix = `${oldPath}/`;
-      const updates = [];
-      Object.entries(this.data.folderGuids).forEach(([path, guid]) => {
-        if (path === oldPath || path.startsWith(prefix)) {
-          const nextPath = path === oldPath ? file.path : `${file.path}${path.slice(oldPath.length)}`;
-          updates.push([path, nextPath, guid]);
-        }
+      const movedGuid = this.data.folderGuids[oldPath];
+      const oldParent = parentPath(oldPath);
+      migratePathMappings(this.data.folderGuids, oldPath, file.path);
+      const fileUpdates = migratePathMappings(this.data.fileGuids, oldPath, file.path);
+      fileUpdates.forEach(([from, to, guid]) => {
+        this.guidByPath.delete(from);
+        this.guidByPath.set(to, guid);
       });
-      updates.forEach(([from, to, guid]) => {
-        delete this.data.folderGuids[from];
-        this.data.folderGuids[to] = guid;
-      });
-    } else if (isMarkdown(file)) {
-      const guid = this.guidByPath.get(oldPath) || this.readCachedFrontmatterGuid(file);
+      const newParent = ((_a = file.parent) == null ? void 0 : _a.path) || "";
+      if (movedGuid && oldParent !== newParent) {
+        if (file.parent) await this.ensureFolderGuid(file.parent);
+        relocateGuid(
+          this.data.orderByFolder,
+          this.folderKeySync(file.parent),
+          movedGuid,
+          this.data.settings.newItemPlacement
+        );
+      }
+    } else if (file instanceof import_obsidian.TFile) {
+      const guid = this.guidByPath.get(oldPath) || (isMarkdown(file) ? this.readCachedFrontmatterGuid(file) : this.data.fileGuids[oldPath]);
       this.guidByPath.delete(oldPath);
       if (guid) {
         this.guidByPath.set(file.path, guid);
+        if (!isMarkdown(file)) {
+          delete this.data.fileGuids[oldPath];
+          this.data.fileGuids[file.path] = guid;
+        }
         const oldParent = parentPath(oldPath);
-        const newParent = ((_a = file.parent) == null ? void 0 : _a.path) || "";
+        const newParent = ((_b = file.parent) == null ? void 0 : _b.path) || "";
         if (oldParent !== newParent) {
           removeGuidFromOrders(this.data.orderByFolder, guid);
           if (file.parent) await this.ensureFolderGuid(file.parent);
@@ -425,25 +602,139 @@ ${text}`;
     this.queueSave();
     this.refreshExplorer();
   }
-  async handleModify(file) {
-    if (!this.app.workspace.layoutReady) return;
-    if (file instanceof import_obsidian.TFile && basename(file.path) === MANIFEST_NAME) {
-      if (this.data.settings.autoSeedFromManifest) await this.seedFromManifests(false);
-    }
-  }
   addGuidToFolder(folder, guid) {
     const key = this.folderKeySync(folder);
     const order = this.data.orderByFolder[key] || [];
-    if (order.includes(guid)) return;
-    this.data.orderByFolder[key] = this.data.settings.newItemPlacement === "top" ? [guid, ...order] : [...order, guid];
+    this.data.orderByFolder[key] = insertGuid(order, guid, this.data.settings.newItemPlacement);
   }
-  async seedFromManifests(force) {
-    await this.seedFromManifestsInternal(force);
-  }
-  async seedFromManifestsInternal(force) {
+  async requestManifestImport() {
     const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
     if (!manifests.length) {
-      if (force) new import_obsidian.Notice("\u672A\u627E\u5230 _yuque_order.json");
+      new import_obsidian.Notice("\u672A\u627E\u5230 _yuque_order.json");
+      return;
+    }
+    const report = await this.inspectManifestConsistency(manifests);
+    if (manifestIssueCount(report) > 0) {
+      const proceed = await new Promise((resolve) => {
+        new ManifestImportConfirmModal(this.app, report, resolve).open();
+      });
+      if (!proceed) {
+        new import_obsidian.Notice("\u5DF2\u653E\u5F03\u5BFC\u5165\u8BED\u96C0\u987A\u5E8F\u6E05\u5355");
+        return;
+      }
+    }
+    this.manifestNoticeShown = false;
+    await this.seedFromManifests();
+  }
+  async inspectManifestConsistency(manifests) {
+    var _a;
+    const report = {
+      missing: [],
+      extra: [],
+      moved: [],
+      duplicateManifestGuids: [],
+      duplicateActualGuids: [],
+      invalidManifests: []
+    };
+    const all = this.app.vault.getAllLoadedFiles();
+    const byGuid = /* @__PURE__ */ new Map();
+    const folderByGuid = /* @__PURE__ */ new Map();
+    all.forEach((item) => {
+      const guid = this.getItemGuidSync(item);
+      if (!guid) return;
+      if (item instanceof import_obsidian.TFolder) folderByGuid.set(guid, item);
+      else if (item instanceof import_obsidian.TFile) byGuid.set(guid, item);
+    });
+    for (const manifestFile of manifests) {
+      let raw;
+      try {
+        raw = JSON.parse(await this.app.vault.read(manifestFile));
+      } catch (e) {
+        report.invalidManifests.push(`${manifestFile.path}\uFF1AJSON \u65E0\u6CD5\u89E3\u6790`);
+        continue;
+      }
+      if ((raw == null ? void 0 : raw.version) !== 1 || !Array.isArray(raw.tree)) {
+        report.invalidManifests.push(`${manifestFile.path}\uFF1A\u7248\u672C\u6216 tree \u683C\u5F0F\u65E0\u6548`);
+        continue;
+      }
+      const manifestEntries = [];
+      const manifestGuids = [];
+      const collect = (nodes, parentGuid, trail) => {
+        nodes.forEach((node) => {
+          var _a2;
+          const guid = normalizeGuid(node == null ? void 0 : node.guid);
+          if (!guid) return;
+          const title = String((node == null ? void 0 : node.title) || guid);
+          const label = trail ? `${trail}/${title}` : `${((_a2 = manifestFile.parent) == null ? void 0 : _a2.path) || ""}/${title}`;
+          manifestEntries.push({ guid, parentGuid, label });
+          manifestGuids.push(guid);
+          if (Array.isArray(node == null ? void 0 : node.children)) collect(node.children, guid, label);
+        });
+      };
+      collect(raw.tree, ROOT_FOLDER_KEY, "");
+      const folderAliases = /* @__PURE__ */ new Map();
+      const adoptedFolderPaths = /* @__PURE__ */ new Set();
+      const manifestGuidSet = new Set(manifestGuids);
+      const resolveTree = (nodes, fallbackFolder) => {
+        nodes.forEach((node) => {
+          const guid = normalizeGuid(node == null ? void 0 : node.guid);
+          if (!guid) return;
+          let item = byGuid.get(guid) || folderByGuid.get(guid) || null;
+          if (!item) {
+            const folder = this.matchManifestNodeToFolder(
+              fallbackFolder,
+              node,
+              adoptedFolderPaths,
+              manifestGuidSet
+            );
+            if (folder) {
+              folderAliases.set(folder.path, guid);
+              folderByGuid.set(guid, folder);
+              item = folder;
+            }
+          }
+          const logicalItem = folderByGuid.get(guid) || (item instanceof import_obsidian.TFile ? this.findFolderForNote(item) : null) || item;
+          const childFolder = logicalItem instanceof import_obsidian.TFolder ? logicalItem : (logicalItem == null ? void 0 : logicalItem.parent) || fallbackFolder;
+          if (Array.isArray(node == null ? void 0 : node.children)) resolveTree(node.children, childFolder);
+        });
+      };
+      resolveTree(raw.tree, manifestFile.parent);
+      const logicalItems = /* @__PURE__ */ new Map();
+      const rootPath = ((_a = manifestFile.parent) == null ? void 0 : _a.path) || "";
+      const prefix = rootPath ? `${rootPath}/` : "";
+      all.forEach((item) => {
+        if (!(item instanceof import_obsidian.TFolder || item instanceof import_obsidian.TFile)) return;
+        if (item === manifestFile || item.path === rootPath) return;
+        if (prefix && !item.path.startsWith(prefix)) return;
+        const guid = this.getItemGuidSync(item);
+        if (!guid) return;
+        let logicalItem = item;
+        if (item instanceof import_obsidian.TFile && isMarkdown(item)) {
+          const ownFolder = item.parent && item.basename === item.parent.name ? item.parent : null;
+          logicalItem = ownFolder || this.findFolderForNote(item) || item;
+        }
+        logicalItems.set(logicalItem.path, logicalItem);
+      });
+      const actualEntries = [...logicalItems.values()].map((item) => {
+        const originalGuid = this.getItemGuidSync(item) || `path:${item.path}`;
+        const guid = folderAliases.get(item.path) || originalGuid;
+        const parent = item.parent;
+        const parentGuid = !parent || parent.path === rootPath ? ROOT_FOLDER_KEY : folderAliases.get(parent.path) || this.getItemGuidSync(parent) || `path:${parent.path}`;
+        return { guid, parentGuid, label: item.path };
+      });
+      const comparison = compareInventories(manifestEntries, actualEntries);
+      report.missing.push(...comparison.missing);
+      report.extra.push(...comparison.extra);
+      report.moved.push(...comparison.moved);
+      report.duplicateManifestGuids.push(...comparison.duplicateManifestGuids);
+      report.duplicateActualGuids.push(...comparison.duplicateActualGuids);
+    }
+    return report;
+  }
+  async seedFromManifests() {
+    const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
+    if (!manifests.length) {
+      new import_obsidian.Notice("\u672A\u627E\u5230 _yuque_order.json");
       return;
     }
     const all = this.app.vault.getAllLoadedFiles();
@@ -453,7 +744,7 @@ ${text}`;
       const guid = this.getItemGuidSync(item);
       if (!guid) return;
       if (item instanceof import_obsidian.TFolder) folderByGuid.set(guid, item);
-      else if (isMarkdown(item)) byGuid.set(guid, item);
+      else if (item instanceof import_obsidian.TFile) byGuid.set(guid, item);
     });
     let seeded = 0;
     const adoptedFolderPaths = /* @__PURE__ */ new Set();
@@ -467,7 +758,6 @@ ${text}`;
         continue;
       }
       if ((raw == null ? void 0 : raw.version) !== 1 || !Array.isArray(raw.tree)) continue;
-      const signature = `logical-folder-note-v3:${raw.generatedAt || ""}:${text.length}:${text.slice(0, 80)}`;
       const manifestGuids = [];
       const collectGuids = (nodes) => nodes.forEach((node) => {
         const guid = normalizeGuid(node == null ? void 0 : node.guid);
@@ -475,8 +765,6 @@ ${text}`;
         if (Array.isArray(node == null ? void 0 : node.children)) collectGuids(node.children);
       });
       collectGuids(raw.tree);
-      const hasUnmatchedItems = manifestGuids.some((guid) => !byGuid.has(guid) && !folderByGuid.has(guid));
-      if (!force && this.data.manifestSignatures[manifestFile.path] === signature && !hasUnmatchedItems) continue;
       const desired = /* @__PURE__ */ new Map();
       const append = (key, guid) => {
         const list = desired.get(key) || [];
@@ -528,19 +816,17 @@ ${text}`;
           seeded += 1;
         }
       });
-      this.data.manifestSignatures[manifestFile.path] = signature;
     }
     if (seeded) {
       await this.flushSave();
       await this.saveData(this.data);
       this.refreshExplorer();
-      if (force || !this.autoSeedNoticeShown) {
-        this.autoSeedNoticeShown = true;
-        new import_obsidian.Notice("\u5DF2\u4ECE\u8BED\u96C0\u6E05\u5355\u5BFC\u5165\u987A\u5E8F");
+      new import_obsidian.Notice("\u5DF2\u4ECE\u8BED\u96C0\u6E05\u5355\u5BFC\u5165\u987A\u5E8F");
+    } else {
+      if (!this.manifestNoticeShown) {
+        this.manifestNoticeShown = true;
+        new import_obsidian.Notice("\u987A\u5E8F\u6E05\u5355\u6CA1\u6709\u53EF\u5339\u914D\u7684\u6587\u6863\uFF0C\u5DF2\u4FDD\u7559\u73B0\u6709\u987A\u5E8F");
       }
-    } else if (force && !this.manifestNoticeShown) {
-      this.manifestNoticeShown = true;
-      new import_obsidian.Notice("\u987A\u5E8F\u6E05\u5355\u6CA1\u6709\u53EF\u5339\u914D\u7684\u6587\u6863\uFF0C\u5DF2\u4FDD\u7559\u73B0\u6709\u987A\u5E8F");
     }
   }
   findFolderForNote(file) {
@@ -741,7 +1027,7 @@ ${text}`;
     const targetGuid = this.getItemGuidSync(target);
     if (!sourceGuid || !targetGuid || !source.parent) return;
     const key = this.folderKeySync(source.parent);
-    const fallbackOrder = source.parent.children.filter((child) => child instanceof import_obsidian.TFolder || isMarkdown(child)).map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
+    const fallbackOrder = source.parent.children.filter((child) => child instanceof import_obsidian.TFolder || child instanceof import_obsidian.TFile).map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
     const currentOrder = ((_c = this.data.orderByFolder[key]) == null ? void 0 : _c.length) ? this.data.orderByFolder[key] : fallbackOrder;
     this.data.orderByFolder[key] = moveGuid(currentOrder, sourceGuid, targetGuid, ratio < 0.5);
     this.queueSave(true);
@@ -832,10 +1118,6 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.saveSettings();
       this.plugin.refreshExplorer();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u81EA\u52A8\u5BFC\u5165\u8BED\u96C0\u6E05\u5355").setDesc("\u68C0\u6D4B\u5230\u65B0\u7684\u6216\u66F4\u65B0\u8FC7\u7684 _yuque_order.json \u65F6\u81EA\u52A8\u64AD\u79CD\uFF1B\u4E0D\u4F1A\u5728\u6BCF\u6B21\u542F\u52A8\u65F6\u8986\u76D6\u5DF2\u62D6\u62FD\u987A\u5E8F\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.autoSeedFromManifest).onChange(async (value) => {
-      this.plugin.data.settings.autoSeedFromManifest = value;
-      await this.plugin.saveSettings();
-    }));
     new import_obsidian.Setting(containerEl).setName("\u589E\u5220\u540E\u7ACB\u5373\u6301\u4E45\u5316").setDesc("\u5173\u95ED\u53EF\u51CF\u5C11 Obsidian Sync \u51B2\u7A81\uFF1B\u62D6\u62FD\u6392\u5E8F\u4ECD\u4F1A\u4FDD\u5B58\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.persistOrderOnCreateDelete).onChange(async (value) => {
       this.plugin.data.settings.persistOrderOnCreateDelete = value;
       await this.plugin.saveSettings();
@@ -844,6 +1126,6 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.data.settings.enableDrag = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u624B\u52A8\u5BFC\u5165/\u91CD\u540C\u6B65").setDesc("\u6309\u5F53\u524D vault \u4E2D\u7684 _yuque_order.json \u5F3A\u5236\u6062\u590D\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F\u3002").addButton((button) => button.setButtonText("\u7ACB\u5373\u5BFC\u5165").onClick(() => void this.plugin.seedFromManifests(true)));
+    new import_obsidian.Setting(containerEl).setName("\u624B\u52A8\u5BFC\u5165/\u91CD\u540C\u6B65").setDesc("\u5148\u6838\u5BF9\u5F53\u524D\u5E93\u4E0E\u6E05\u5355\uFF1B\u4E00\u81F4\u65F6\u76F4\u63A5\u5BFC\u5165\uFF0C\u4E0D\u4E00\u81F4\u65F6\u7531\u4F60\u786E\u8BA4\u662F\u5426\u7EE7\u7EED\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u5BFC\u5165").onClick(() => void this.plugin.requestManifestImport()));
   }
 };

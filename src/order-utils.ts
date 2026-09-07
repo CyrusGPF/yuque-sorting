@@ -77,6 +77,27 @@ export function uniqueKnownOrder(order: string[], knownGuids: Set<string>): stri
   });
 }
 
+/**
+ * Reconcile a folder from a potentially partial vault snapshot. Existing
+ * identities are retained as tombstones so a late-loaded or restored item
+ * returns to its former position; only confirmed create/delete events mutate
+ * them destructively.
+ */
+export function reconcileOrderNonDestructive(
+  previousOrder: string[],
+  currentChildGuids: string[],
+  initialSortedGuids: string[],
+  placement: "top" | "bottom",
+): string[] {
+  const previous = [...new Set(previousOrder)];
+  const current = [...new Set(currentChildGuids)];
+  if (!previous.length) return [...new Set(initialSortedGuids)];
+  const known = new Set(previous);
+  const missing = current.filter((guid) => !known.has(guid));
+  if (!missing.length) return previous;
+  return placement === "top" ? [...missing, ...previous] : [...previous, ...missing];
+}
+
 export function moveGuid(
   order: string[],
   sourceGuid: string,
@@ -107,4 +128,184 @@ export function removeGuidFromOrders(
     }
   });
   return changed;
+}
+
+export function insertGuid(
+  order: string[],
+  guid: string,
+  placement: "top" | "bottom",
+): string[] {
+  if (order.includes(guid)) return order;
+  return placement === "top" ? [guid, ...order] : [...order, guid];
+}
+
+/** Move an identity between folders without disturbing either sibling list. */
+export function relocateGuid(
+  orderByFolder: Record<string, string[]>,
+  targetFolderKey: string,
+  guid: string,
+  placement: "top" | "bottom",
+): void {
+  removeGuidFromOrders(orderByFolder, guid);
+  orderByFolder[targetFolderKey] = insertGuid(
+    orderByFolder[targetFolderKey] || [], guid, placement,
+  );
+}
+
+/** Replace an identity in place, including an order list owned by that identity. */
+export function replaceGuidInOrders(
+  orderByFolder: Record<string, string[]>,
+  oldGuid: string,
+  newGuid: string,
+): boolean {
+  if (!oldGuid || !newGuid || oldGuid === newGuid) return false;
+  let changed = false;
+  Object.keys(orderByFolder).forEach((folderKey) => {
+    const oldOrder = orderByFolder[folderKey] || [];
+    const seen = new Set<string>();
+    const nextOrder = oldOrder
+      .map((guid) => guid === oldGuid ? newGuid : guid)
+      .filter((guid) => {
+        if (seen.has(guid)) return false;
+        seen.add(guid);
+        return true;
+      });
+    if (nextOrder.length !== oldOrder.length
+      || nextOrder.some((guid, index) => guid !== oldOrder[index])) {
+      orderByFolder[folderKey] = nextOrder;
+      changed = true;
+    }
+  });
+  if (Object.prototype.hasOwnProperty.call(orderByFolder, oldGuid)) {
+    const oldChildren = orderByFolder[oldGuid] || [];
+    const newChildren = orderByFolder[newGuid] || [];
+    orderByFolder[newGuid] = [...new Set([...oldChildren, ...newChildren])];
+    delete orderByFolder[oldGuid];
+    changed = true;
+  }
+  return changed;
+}
+
+/** Resolve a folder-note relationship from the deleted file's preserved path. */
+export function folderIdentityPathForNote(
+  notePath: string,
+  folderGuids: Record<string, string>,
+  guid: string,
+): string | null {
+  const withoutExtension = notePath.replace(/\.md$/i, "");
+  const slash = notePath.lastIndexOf("/");
+  const parent = slash < 0 ? "" : notePath.slice(0, slash);
+  const noteName = withoutExtension.slice(withoutExtension.lastIndexOf("/") + 1);
+  const parentName = parent.slice(parent.lastIndexOf("/") + 1);
+  const candidates = noteName === parentName ? [parent, withoutExtension] : [withoutExtension];
+  return candidates.find((path) => path && folderGuids[path] === guid) || null;
+}
+
+/**
+ * A deleted folder note relinquishes only its hidden self-entry. The same GUID
+ * remains the stable identity of the folder and keeps its parent-list position.
+ */
+export function detachFolderNoteFromOrder(
+  orderByFolder: Record<string, string[]>,
+  folderGuid: string,
+): boolean {
+  const ownedOrder = orderByFolder[folderGuid];
+  if (!ownedOrder) return false;
+  const next = ownedOrder.filter((guid) => guid !== folderGuid);
+  if (next.length === ownedOrder.length) return false;
+  orderByFolder[folderGuid] = next;
+  return true;
+}
+
+/** Migrate path-keyed identities when a file or an ancestor folder moves. */
+export function migratePathMappings(
+  mappings: Record<string, string>,
+  oldPath: string,
+  newPath: string,
+): Array<[string, string, string]> {
+  const prefix = `${oldPath}/`;
+  const updates: Array<[string, string, string]> = [];
+  Object.entries(mappings).forEach(([path, guid]) => {
+    if (path === oldPath || path.startsWith(prefix)) {
+      const nextPath = path === oldPath ? newPath : `${newPath}${path.slice(oldPath.length)}`;
+      updates.push([path, nextPath, guid]);
+    }
+  });
+  updates.forEach(([from, to, guid]) => {
+    delete mappings[from];
+    mappings[to] = guid;
+  });
+  return updates;
+}
+
+/**
+ * Remove a deleted folder subtree both as ordered children and as owners of
+ * their own order lists. This is intentionally idempotent because Obsidian may
+ * emit a parent-folder delete before or after the deletes for its descendants.
+ */
+export function purgeFolderGuidsFromOrders(
+  orderByFolder: Record<string, string[]>,
+  guids: Iterable<string>,
+): boolean {
+  const deleted = new Set(guids);
+  if (!deleted.size) return false;
+
+  let changed = false;
+  Object.keys(orderByFolder).forEach((folderKey) => {
+    if (deleted.has(folderKey)) {
+      delete orderByFolder[folderKey];
+      changed = true;
+      return;
+    }
+    const oldOrder = orderByFolder[folderKey] || [];
+    const nextOrder = oldOrder.filter((guid) => !deleted.has(guid));
+    if (nextOrder.length !== oldOrder.length) {
+      orderByFolder[folderKey] = nextOrder;
+      changed = true;
+    }
+  });
+  return changed;
+}
+
+export type InventoryEntry = {
+  guid: string;
+  parentGuid: string;
+  label: string;
+};
+
+export type InventoryComparison = {
+  missing: InventoryEntry[];
+  extra: InventoryEntry[];
+  moved: Array<{ expected: InventoryEntry; actual: InventoryEntry }>;
+  duplicateManifestGuids: string[];
+  duplicateActualGuids: string[];
+};
+
+/** Compare identity and hierarchy, deliberately ignoring sibling order. */
+export function compareInventories(
+  manifestEntries: InventoryEntry[],
+  actualEntries: InventoryEntry[],
+): InventoryComparison {
+  const groupByGuid = (entries: InventoryEntry[]) => {
+    const grouped = new Map<string, InventoryEntry[]>();
+    entries.forEach((entry) => grouped.set(entry.guid, [...(grouped.get(entry.guid) || []), entry]));
+    return grouped;
+  };
+  const manifestByGuid = groupByGuid(manifestEntries);
+  const actualByGuid = groupByGuid(actualEntries);
+  const duplicateManifestGuids = [...manifestByGuid]
+    .filter(([, entries]) => entries.length > 1).map(([guid]) => guid);
+  const duplicateActualGuids = [...actualByGuid]
+    .filter(([, entries]) => entries.length > 1).map(([guid]) => guid);
+  const missing = manifestEntries.filter((entry) => !actualByGuid.has(entry.guid));
+  const extra = actualEntries.filter((entry) => !manifestByGuid.has(entry.guid));
+  const moved: Array<{ expected: InventoryEntry; actual: InventoryEntry }> = [];
+  manifestByGuid.forEach((expectedEntries, guid) => {
+    const actualEntriesForGuid = actualByGuid.get(guid);
+    if (expectedEntries.length !== 1 || actualEntriesForGuid?.length !== 1) return;
+    const expected = expectedEntries[0];
+    const actual = actualEntriesForGuid[0];
+    if (expected.parentGuid !== actual.parentGuid) moved.push({ expected, actual });
+  });
+  return { missing, extra, moved, duplicateManifestGuids, duplicateActualGuids };
 }
