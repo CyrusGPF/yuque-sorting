@@ -29,6 +29,7 @@ import {
   sanitizePortableName,
   sortEntries,
 } from "./src/order-utils";
+import { DropPosition, dropPositionForPointer } from "./src/drag-utils";
 
 const MANIFEST_NAME = "_yuque_order.json";
 
@@ -46,6 +47,12 @@ interface OrderData {
   orderByFolder: Record<string, string[]>;
   folderGuids: Record<string, string>;
   fileGuids: Record<string, string>;
+}
+
+interface PendingDropPlacement {
+  parentPath: string;
+  targetGuid: string;
+  before: boolean;
 }
 
 const DEFAULT_SETTINGS: OrderSettings = {
@@ -149,6 +156,8 @@ export default class YqOrderDragPlugin extends Plugin {
   private explorerSetup = false;
   private manifestNoticeShown = false;
   private dragSourcePath = "";
+  private dragHintEl: HTMLElement | null = null;
+  private pendingDropPlacements = new Map<string, PendingDropPlacement>();
 
   async onload(): Promise<void> {
     this.data = this.normalizeData((await this.loadData()) as Partial<OrderData> | null);
@@ -492,12 +501,18 @@ export default class YqOrderDragPlugin extends Plugin {
       const newParent = file.parent?.path || "";
       if (movedGuid && oldParent !== newParent) {
         if (file.parent) await this.ensureFolderGuid(file.parent);
-        relocateGuid(
-          this.data.orderByFolder,
-          this.folderKeySync(file.parent),
-          movedGuid,
-          this.data.settings.newItemPlacement,
-        );
+        const pending = this.pendingDropPlacements.get(movedGuid);
+        if (pending?.parentPath === newParent) {
+          this.pendingDropPlacements.delete(movedGuid);
+          this.placeGuidRelative(file.parent, movedGuid, pending.targetGuid, pending.before);
+        } else {
+          relocateGuid(
+            this.data.orderByFolder,
+            this.folderKeySync(file.parent),
+            movedGuid,
+            this.data.settings.newItemPlacement,
+          );
+        }
       }
     } else if (file instanceof TFile) {
       const guid = this.guidByPath.get(oldPath)
@@ -512,9 +527,15 @@ export default class YqOrderDragPlugin extends Plugin {
         const oldParent = parentPath(oldPath);
         const newParent = file.parent?.path || "";
         if (oldParent !== newParent) {
-          removeGuidFromOrders(this.data.orderByFolder, guid);
           if (file.parent) await this.ensureFolderGuid(file.parent);
-          this.addGuidToFolder(file.parent, guid);
+          const pending = this.pendingDropPlacements.get(guid);
+          if (pending?.parentPath === newParent) {
+            this.pendingDropPlacements.delete(guid);
+            this.placeGuidRelative(file.parent, guid, pending.targetGuid, pending.before);
+          } else {
+            removeGuidFromOrders(this.data.orderByFolder, guid);
+            this.addGuidToFolder(file.parent, guid);
+          }
         }
       }
     }
@@ -526,6 +547,12 @@ export default class YqOrderDragPlugin extends Plugin {
     const key = this.folderKeySync(folder);
     const order = this.data.orderByFolder[key] || [];
     this.data.orderByFolder[key] = insertGuid(order, guid, this.data.settings.newItemPlacement);
+  }
+
+  private placeGuidRelative(folder: TFolder | null, guid: string, targetGuid: string, before: boolean): void {
+    const key = this.folderKeySync(folder);
+    relocateGuid(this.data.orderByFolder, key, guid, this.data.settings.newItemPlacement);
+    this.data.orderByFolder[key] = moveGuid(this.data.orderByFolder[key], guid, targetGuid, before);
   }
 
   async requestManifestImport(): Promise<void> {
@@ -911,6 +938,67 @@ export default class YqOrderDragPlugin extends Plugin {
     return title?.dataset.path || title?.getAttribute("data-path") || "";
   }
 
+  private dropSurface(element: HTMLElement): HTMLElement {
+    return element.querySelector<HTMLElement>(
+      ":scope > .nav-file-title, :scope > .nav-folder-title",
+    ) || element;
+  }
+
+  private canNestDrop(source: TAbstractFile, target: TAbstractFile): boolean {
+    if (target instanceof TFolder) {
+      return target !== source && !target.path.startsWith(`${source.path}/`);
+    }
+    return source instanceof TFile && isMarkdown(target);
+  }
+
+  private dropPosition(sourcePath: string, targetPath: string, clientY: number, targetEl: HTMLElement): DropPosition {
+    const source = this.app.vault.getAbstractFileByPath(sourcePath);
+    const target = this.app.vault.getAbstractFileByPath(targetPath);
+    const surface = this.dropSurface(targetEl);
+    const rect = surface.getBoundingClientRect();
+    return dropPositionForPointer(
+      clientY,
+      rect.top,
+      rect.height,
+      Boolean(source && target && this.canNestDrop(source, target)),
+    );
+  }
+
+  private showDropFeedback(targetEl: HTMLElement, position: DropPosition, clientX: number, clientY: number): void {
+    this.clearDropTargets();
+    targetEl.classList.add(`yq-order-drop-${position}`);
+
+    if (!this.dragHintEl) {
+      this.dragHintEl = document.createElement("div");
+      this.dragHintEl.className = "yq-order-drag-hint";
+      document.body.appendChild(this.dragHintEl);
+    }
+    const targetName = this.dropSurface(targetEl).textContent?.trim() || this.pathFromElement(targetEl);
+    const action = position === "before" ? "插入到上方" : position === "after" ? "插入到下方" : "移入";
+    this.dragHintEl.textContent = `${action}：${targetName}`;
+    const hintRect = this.dragHintEl.getBoundingClientRect();
+    const left = Math.max(8, Math.min(clientX + 14, window.innerWidth - hintRect.width - 8));
+    const below = clientY + 18;
+    const top = below + hintRect.height <= window.innerHeight - 8
+      ? below
+      : Math.max(8, clientY - hintRect.height - 14);
+    this.dragHintEl.style.left = `${left}px`;
+    this.dragHintEl.style.top = `${top}px`;
+  }
+
+  private clearDropTargets(): void {
+    document.querySelectorAll(".yq-order-drop-before, .yq-order-drop-inside, .yq-order-drop-after")
+      .forEach((element) => element.classList.remove(
+        "yq-order-drop-before", "yq-order-drop-inside", "yq-order-drop-after",
+      ));
+  }
+
+  private clearDropFeedback(): void {
+    this.clearDropTargets();
+    this.dragHintEl?.remove();
+    this.dragHintEl = null;
+  }
+
   private installDragHandlers(): void {
     const explorerContainer = this.getExplorerContainer() || undefined;
     if (explorerContainer) {
@@ -939,17 +1027,28 @@ export default class YqOrderDragPlugin extends Plugin {
     this.registerDomEvent(document, "dragover", (event) => {
       if (!this.dragSourcePath) return;
       const item = this.explorerItem(event.target);
-      if (!item || this.pathFromElement(item) === this.dragSourcePath) return;
+      if (!item || this.pathFromElement(item) === this.dragSourcePath) {
+        this.clearDropFeedback();
+        return;
+      }
       event.preventDefault();
-      document.querySelectorAll(".yq-order-drag-over").forEach((el) => el.classList.remove("yq-order-drag-over"));
-      item.classList.add("yq-order-drag-over");
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      const position = this.dropPosition(
+        this.dragSourcePath,
+        this.pathFromElement(item),
+        event.clientY,
+        item,
+      );
+      this.showDropFeedback(item, position, event.clientX, event.clientY);
     }, true);
     this.registerDomEvent(document, "drop", (event) => {
       if (!this.dragSourcePath) return;
       const target = this.explorerItem(event.target);
       if (!target) return;
       event.preventDefault();
-      void this.handleDrop(this.dragSourcePath, this.pathFromElement(target), event.clientY, target);
+      const targetPath = this.pathFromElement(target);
+      const position = this.dropPosition(this.dragSourcePath, targetPath, event.clientY, target);
+      void this.handleDrop(this.dragSourcePath, targetPath, position);
       this.clearDragState();
     }, true);
     this.registerDomEvent(document, "dragend", () => this.clearDragState(), true);
@@ -957,20 +1056,23 @@ export default class YqOrderDragPlugin extends Plugin {
 
   private clearDragState(): void {
     this.dragSourcePath = "";
-    document.querySelectorAll(".yq-order-drag-source, .yq-order-drag-over").forEach((el) => {
-      el.classList.remove("yq-order-drag-source", "yq-order-drag-over");
+    document.querySelectorAll(
+      ".yq-order-drag-source, .yq-order-drop-before, .yq-order-drop-inside, .yq-order-drop-after",
+    ).forEach((el) => {
+      el.classList.remove(
+        "yq-order-drag-source", "yq-order-drop-before", "yq-order-drop-inside", "yq-order-drop-after",
+      );
     });
+    this.clearDropFeedback();
   }
 
-  private async handleDrop(sourcePath: string, targetPath: string, clientY: number, targetEl: HTMLElement): Promise<void> {
+  private async handleDrop(sourcePath: string, targetPath: string, position: DropPosition): Promise<void> {
     const source = this.app.vault.getAbstractFileByPath(sourcePath);
     const target = this.app.vault.getAbstractFileByPath(targetPath);
     if (!source || !target || source.path === target.path) return;
-    const rect = targetEl.getBoundingClientRect();
-    const ratio = rect.height ? (clientY - rect.top) / rect.height : 0.5;
-    let targetFolder = target instanceof TFolder
+    let targetFolder = position === "inside" && target instanceof TFolder
       ? target
-      : target instanceof TFile && ratio > 0.25 && ratio < 0.75
+      : position === "inside" && target instanceof TFile
         ? this.findFolderForNote(target)
         : null;
 
@@ -978,7 +1080,7 @@ export default class YqOrderDragPlugin extends Plugin {
     // when it does not have a folder yet: Parent.md -> Parent/Parent.md.
     // This is the V1 bridge between Yuque's parent-doc gesture and Obsidian's
     // filesystem-based nesting model.
-    if (!targetFolder && target instanceof TFile && isMarkdown(target) && ratio > 0.25 && ratio < 0.75) {
+    if (!targetFolder && position === "inside" && target instanceof TFile && isMarkdown(target)) {
       if (source instanceof TFolder) return;
       const folderPath = stripMarkdown(target.path);
       try {
@@ -1012,10 +1114,35 @@ export default class YqOrderDragPlugin extends Plugin {
       return;
     }
 
-    if (source.parent?.path !== target.parent?.path) return;
     const sourceGuid = this.getItemGuidSync(source);
     const targetGuid = this.getItemGuidSync(target);
-    if (!sourceGuid || !targetGuid || !source.parent) return;
+    if (!sourceGuid || !targetGuid || !source.parent || !target.parent) return;
+
+    if (source.parent.path !== target.parent.path) {
+      if (target.parent === source || target.parent.path.startsWith(`${source.path}/`)) {
+        new Notice("不能把文件夹移动到它自己的子目录中");
+        return;
+      }
+      const destination = target.parent.path
+        ? `${target.parent.path}/${basename(source.path)}`
+        : basename(source.path);
+      if (this.app.vault.getAbstractFileByPath(destination)) {
+        new Notice("目标目录中已存在同名文件");
+        return;
+      }
+      this.pendingDropPlacements.set(sourceGuid, {
+        parentPath: target.parent.path,
+        targetGuid,
+        before: position === "before",
+      });
+      try {
+        await this.app.fileManager.renameFile(source as any, destination);
+      } catch (error) {
+        this.pendingDropPlacements.delete(sourceGuid);
+        new Notice(`移动失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
     const key = this.folderKeySync(source.parent);
     const fallbackOrder = source.parent.children
       .filter((child) => child instanceof TFolder || child instanceof TFile)
@@ -1024,7 +1151,7 @@ export default class YqOrderDragPlugin extends Plugin {
     const currentOrder = this.data.orderByFolder[key]?.length
       ? this.data.orderByFolder[key]
       : fallbackOrder;
-    this.data.orderByFolder[key] = moveGuid(currentOrder, sourceGuid, targetGuid, ratio < 0.5);
+    this.data.orderByFolder[key] = moveGuid(currentOrder, sourceGuid, targetGuid, position === "before");
     this.queueSave(true);
     await this.flushSave();
     this.refreshExplorer();
@@ -1158,7 +1285,7 @@ class YqOrderSettingTab extends PluginSettingTab {
       }));
     new Setting(containerEl)
       .setName("启用文件树拖拽")
-      .setDesc("同级拖拽调整顺序；拖到文件夹或文件夹笔记可移动到子目录。")
+      .setDesc("拖到标题行上部或下部可精确插入；拖到中部可移入文件夹或文件夹笔记。拖动时会显示插入线和动作提示。")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.enableDrag).onChange(async (value) => {
         this.plugin.data.settings.enableDrag = value;
         await this.plugin.saveSettings();

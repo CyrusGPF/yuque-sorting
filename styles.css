@@ -1,9 +1,87 @@
 .yq-order-drag-source {
-  opacity: 0.45;
+  opacity: 0.38;
+  transform: scale(0.985);
+  transition: opacity 120ms ease, transform 120ms ease;
 }
 
-.yq-order-drag-over {
-  outline: 1px solid var(--interactive-accent);
-  outline-offset: -1px;
-  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+.yq-order-drop-before > .nav-file-title,
+.yq-order-drop-before > .nav-folder-title,
+.yq-order-drop-after > .nav-file-title,
+.yq-order-drop-after > .nav-folder-title {
+  position: relative;
+}
+
+.yq-order-drop-before > .nav-file-title::before,
+.yq-order-drop-before > .nav-folder-title::before,
+.yq-order-drop-after > .nav-file-title::after,
+.yq-order-drop-after > .nav-folder-title::after {
+  content: "";
+  position: absolute;
+  z-index: 20;
+  right: 4px;
+  left: 4px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--interactive-accent);
+  box-shadow: 0 0 0 1px var(--background-primary), 0 0 8px var(--interactive-accent);
+  animation: yq-order-drop-pulse 700ms ease-in-out infinite alternate;
+}
+
+.yq-order-drop-before > .nav-file-title::before,
+.yq-order-drop-before > .nav-folder-title::before {
+  top: -2px;
+}
+
+.yq-order-drop-after > .nav-file-title::after,
+.yq-order-drop-after > .nav-folder-title::after {
+  bottom: -2px;
+}
+
+.yq-order-drop-inside > .nav-file-title,
+.yq-order-drop-inside > .nav-folder-title {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+  border-radius: var(--radius-s);
+  background: color-mix(in srgb, var(--interactive-accent) 18%, transparent);
+  transition: background 100ms ease, outline-color 100ms ease;
+}
+
+.yq-order-drag-hint {
+  position: fixed;
+  z-index: 10000;
+  max-width: min(360px, 70vw);
+  padding: 5px 9px;
+  overflow: hidden;
+  color: var(--text-on-accent);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+  border-radius: var(--radius-s);
+  background: var(--interactive-accent);
+  box-shadow: var(--shadow-s);
+  animation: yq-order-hint-in 100ms ease-out;
+}
+
+@keyframes yq-order-drop-pulse {
+  from { opacity: 0.72; }
+  to { opacity: 1; }
+}
+
+@keyframes yq-order-hint-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yq-order-drag-source,
+  .yq-order-drag-hint,
+  .yq-order-drop-before > .nav-file-title::before,
+  .yq-order-drop-before > .nav-folder-title::before,
+  .yq-order-drop-after > .nav-file-title::after,
+  .yq-order-drop-after > .nav-folder-title::after {
+    animation: none;
+    transition: none;
+  }
 }

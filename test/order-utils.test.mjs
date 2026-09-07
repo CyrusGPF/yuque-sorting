@@ -18,6 +18,15 @@ import {
   sortEntries,
   uniqueKnownOrder,
 } from "../src/order-utils.ts";
+import { dropPositionForPointer } from "../src/drag-utils.ts";
+
+test("drag targeting exposes precise before, inside, and after zones", () => {
+  assert.equal(dropPositionForPointer(100, 100, 20, true), "before");
+  assert.equal(dropPositionForPointer(109, 100, 20, true), "inside");
+  assert.equal(dropPositionForPointer(120, 100, 20, true), "after");
+  assert.equal(dropPositionForPointer(109, 100, 20, false), "before");
+  assert.equal(dropPositionForPointer(111, 100, 20, false), "after");
+});
 
 test("sortEntries keeps saved guid order and puts unknown items last", () => {
   const items = [
@@ -121,6 +130,13 @@ test("rename in place changes no order and moving preserves both sibling lists",
   assert.deepEqual(orders, beforeRename);
   relocateGuid(orders, "target", "moving", "bottom");
   assert.deepEqual(orders, { source: ["a", "b"], target: ["c", "d", "moving"] });
+});
+
+test("an explicit cross-folder drop keeps siblings stable and honors its exact target", () => {
+  const orders = { source: ["a", "moving", "b"], target: ["c", "d"] };
+  relocateGuid(orders, "target", "moving", "bottom");
+  orders.target = moveGuid(orders.target, "moving", "c", true);
+  assert.deepEqual(orders, { source: ["a", "b"], target: ["moving", "c", "d"] });
 });
 
 test("folder-note identity changes keep the folder in the same position", () => {

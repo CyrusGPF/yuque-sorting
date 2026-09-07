@@ -7,7 +7,14 @@ Yuque Order Drag is the Obsidian companion for YuqueOut V1 exports.
 1. In YuqueOut, keep `写入稳定 guid` and `生成 _yuque_order.json` enabled. Turn off `层级序号前缀` and the legacy per-note `order` field.
 2. Copy the exported knowledge base into an Obsidian vault.
 3. Install this folder as `.obsidian/plugins/yuque-order-drag/`, enable the plugin, and let it scan the vault.
-4. Run **导入/重同步语雀顺序清单** (or click **检查并导入** in settings) when you explicitly want to apply `_yuque_order.json`. Afterwards, drag items in the File Explorer to reorder them. Dragging to a folder, or to a folder-note that already has a matching folder, moves an item into that folder.
+4. Run **导入/重同步语雀顺序清单** (or click **检查并导入** in settings) when you explicitly want to apply `_yuque_order.json`.
+
+## Precise drag and drop
+
+- Drop on the upper 30% of a title row to insert before it.
+- Drop on the lower 30% to insert after it.
+- Drop in the highlighted center of a folder or folder-note to move the item inside it.
+- Follow the insertion line, target highlight, and pointer label for the exact action that will happen when released.
 
 The plugin stores order lists plus ordinary-folder and non-Markdown-file identities in its own `data.json`. Markdown files receive one stable identity field (`guid` by default). Images, PDFs, Canvas files, JSON, and every other `TFile` type participate in the same stable ordering; their identities are path-migrated in `data.json` on rename or move.
 
@@ -25,4 +32,6 @@ npm run build
 npm test
 ```
 
-The build emits `main.js` beside `manifest.json` and `styles.css`, ready for a manually loaded plugin directory.
+The build emits `main.js` beside `manifest.json` and `styles.css`, and copies all three plugin artifacts into `dist/`.
+
+To update a manually loaded plugin, take the whole `dist/` folder and copy its three files into `.obsidian/plugins/yuque-order-drag/`. Never overwrite `data.json` there — it holds the order data and identities for that specific vault.
