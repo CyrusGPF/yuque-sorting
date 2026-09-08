@@ -5,6 +5,12 @@ export type SortableEntry = {
   name: string;
 };
 
+export type GuidOrderPosition = {
+  previousGuid: string | null;
+  nextGuid: string | null;
+  originalIndex: number;
+};
+
 const entryNameCollator = new Intl.Collator(undefined, {
   numeric: true,
   sensitivity: "base",
@@ -125,6 +131,36 @@ export function moveGuid(
     return next;
   }
   next.splice(insertBefore ? targetIndex : targetIndex + 1, 0, sourceGuid);
+  return next;
+}
+
+export function captureGuidOrderPosition(order: string[], guid: string): GuidOrderPosition {
+  const index = order.indexOf(guid);
+  return {
+    previousGuid: index > 0 ? order[index - 1] : null,
+    nextGuid: index >= 0 && index + 1 < order.length ? order[index + 1] : null,
+    originalIndex: index >= 0 ? index : order.length,
+  };
+}
+
+/** Restore one identity without overwriting unrelated sibling changes. */
+export function restoreGuidOrderPosition(
+  order: string[],
+  guid: string,
+  position: GuidOrderPosition,
+): string[] {
+  const next = order.filter((itemGuid) => itemGuid !== guid);
+  const previousIndex = position.previousGuid ? next.indexOf(position.previousGuid) : -1;
+  if (previousIndex >= 0) {
+    next.splice(previousIndex + 1, 0, guid);
+    return next;
+  }
+  const followingIndex = position.nextGuid ? next.indexOf(position.nextGuid) : -1;
+  if (followingIndex >= 0) {
+    next.splice(followingIndex, 0, guid);
+    return next;
+  }
+  next.splice(Math.max(0, Math.min(position.originalIndex, next.length)), 0, guid);
   return next;
 }
 

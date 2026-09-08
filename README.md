@@ -15,6 +15,7 @@ Yuque Order Drag is the Obsidian companion for YuqueOut V1 exports.
 - Drop on the lower 30% to insert after it.
 - Drop in the highlighted center of a folder or folder-note to move the item inside it.
 - Follow the insertion line, target highlight, and pointer label for the exact action that will happen when released.
+- Use the **撤销** button in the completion notice, or run **撤销上一次语雀拖拽** from the command palette, to reverse the latest successful drag. Undo refuses to run if a path conflict or unrelated item inside a newly created folder would make recovery unsafe.
 
 The plugin stores order lists plus ordinary-folder and non-Markdown-file identities in its own `data.json`. Markdown files receive one stable identity field (`guid` by default). Images, PDFs, Canvas files, JSON, and every other `TFile` type participate in the same stable ordering; their identities are path-migrated in `data.json` on rename or move.
 

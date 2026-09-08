@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import {
   compareEntryNames,
   compareInventories,
+  captureGuidOrderPosition,
   detachFolderNoteFromOrder,
   folderIdentityPathForNote,
   insertGuid,
@@ -14,6 +15,7 @@ import {
   relocateGuid,
   removeGuidFromOrders,
   replaceGuidInOrders,
+  restoreGuidOrderPosition,
   sanitizePortableName,
   sortEntries,
   uniqueKnownOrder,
@@ -57,6 +59,56 @@ test("sortEntries cache is invalidated by replacing the immutable order array", 
 test("moveGuid moves an item before or after a target", () => {
   assert.deepEqual(moveGuid(["a", "b", "c"], "c", "a", true), ["c", "a", "b"]);
   assert.deepEqual(moveGuid(["a", "b", "c"], "a", "b", false), ["b", "a", "c"]);
+});
+
+test("undo restores a dragged identity without overwriting unrelated sibling changes", () => {
+  const original = ["a", "moving", "b", "c"];
+  const position = captureGuidOrderPosition(original, "moving");
+  const changedWhileMoved = ["new", "a", "b", "c"];
+  assert.deepEqual(
+    restoreGuidOrderPosition(changedWhileMoved, "moving", position),
+    ["new", "a", "moving", "b", "c"],
+  );
+  assert.deepEqual(
+    restoreGuidOrderPosition(["new", "b", "c"], "moving", position),
+    ["new", "moving", "b", "c"],
+  );
+});
+
+test("folder-note conversion keeps the shared identity at its original parent position", () => {
+  const orders = {
+    parent: ["before", "folder-note-guid", "after"],
+    "folder-note-guid": ["folder-note-guid", "child"],
+  };
+  detachFolderNoteFromOrder(orders, "folder-note-guid");
+  assert.deepEqual(orders, {
+    parent: ["before", "folder-note-guid", "after"],
+    "folder-note-guid": ["child"],
+  });
+});
+
+test("document-into-document move and undo preserve both original parent positions", () => {
+  const orders = {
+    parent: ["before", "source", "target", "after"],
+    target: ["target"],
+  };
+  const sourcePosition = captureGuidOrderPosition(orders.parent, "source");
+  const targetPosition = captureGuidOrderPosition(orders.parent, "target");
+
+  detachFolderNoteFromOrder(orders, "target");
+  relocateGuid(orders, "target", "source", "bottom");
+  assert.deepEqual(orders, {
+    parent: ["before", "target", "after"],
+    target: ["source"],
+  });
+
+  removeGuidFromOrders(orders, "source");
+  orders.parent = restoreGuidOrderPosition(orders.parent, "source", sourcePosition);
+  delete orders.target;
+  orders.parent = restoreGuidOrderPosition(orders.parent, "target", targetPosition);
+  assert.deepEqual(orders, {
+    parent: ["before", "source", "target", "after"],
+  });
 });
 
 test("uniqueKnownOrder removes unknown and duplicate identities", () => {
@@ -255,6 +307,14 @@ test("drag cancellation clears only transient UI state", async () => {
     source.slice(clearStart, dropStart),
     /orderByFolder|removeGuidFromOrders|relocateGuid|moveGuid|saveData/,
   );
+});
+
+test("successful drags expose a guarded undo command and notice action", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  assert.match(source, /id: "undo-last-yuque-drag"/);
+  assert.match(source, /button\.textContent = "撤销"/);
+  assert.match(source, /无法撤销：原位置已存在同名项目/);
+  assert.match(source, /无法撤销：拖拽创建的文件夹中已有其他项目/);
 });
 
 test("explorer refresh requests are coalesced by an animation-frame guard", async () => {

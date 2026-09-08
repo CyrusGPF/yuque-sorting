@@ -12,9 +12,11 @@ import {
 import {
   InventoryComparison,
   InventoryEntry,
+  GuidOrderPosition,
   ROOT_FOLDER_KEY,
   SortableEntry,
   compareInventories,
+  captureGuidOrderPosition,
   detachFolderNoteFromOrder,
   folderIdentityPathForNote,
   insertGuid,
@@ -26,6 +28,7 @@ import {
   removeGuidFromOrders,
   relocateGuid,
   replaceGuidInOrders,
+  restoreGuidOrderPosition,
   sanitizePortableName,
   sortEntries,
 } from "./src/order-utils";
@@ -53,6 +56,23 @@ interface PendingDropPlacement {
   parentPath: string;
   targetGuid: string;
   before: boolean;
+}
+
+interface StoredGuidPosition extends GuidOrderPosition {
+  folderKey: string;
+  guid: string;
+}
+
+interface DragUndoRecord {
+  sourceGuid: string;
+  sourceOriginalPath: string;
+  sourceMovedPath: string;
+  sourcePosition: StoredGuidPosition;
+  createdFolderPath: string | null;
+  targetNoteGuid: string | null;
+  targetNoteOriginalPath: string | null;
+  targetNoteMovedPath: string | null;
+  targetNotePosition: StoredGuidPosition | null;
 }
 
 const DEFAULT_SETTINGS: OrderSettings = {
@@ -168,6 +188,9 @@ export default class YqOrderDragPlugin extends Plugin {
   private dropTargetEl: HTMLElement | null = null;
   private dropTargetPosition: DropPosition | null = null;
   private pendingDropPlacements = new Map<string, PendingDropPlacement>();
+  private pendingUndoPositions = new Map<string, StoredGuidPosition>();
+  private lastDragUndo: DragUndoRecord | null = null;
+  private undoInProgress = false;
 
   async onload(): Promise<void> {
     this.data = this.normalizeData((await this.loadData()) as Partial<OrderData> | null);
@@ -186,6 +209,15 @@ export default class YqOrderDragPlugin extends Plugin {
       id: "refresh-yuque-order",
       name: "刷新语雀式文件顺序",
       callback: () => void this.reconcileVault(true),
+    });
+    this.addCommand({
+      id: "undo-last-yuque-drag",
+      name: "撤销上一次语雀拖拽",
+      checkCallback: (checking) => {
+        if (!this.lastDragUndo || this.undoInProgress) return false;
+        if (!checking) void this.undoLastDrag();
+        return true;
+      },
     });
     this.addSettingTab(new YqOrderSettingTab(this.app, this));
 
@@ -546,8 +578,12 @@ export default class YqOrderDragPlugin extends Plugin {
       const newParent = file.parent?.path || "";
       if (movedGuid && oldParent !== newParent) {
         if (file.parent) await this.ensureFolderGuid(file.parent);
+        const undoPosition = this.pendingUndoPositions.get(movedGuid);
         const pending = this.pendingDropPlacements.get(movedGuid);
-        if (pending?.parentPath === newParent) {
+        if (undoPosition && undoPosition.folderKey === this.folderKeySync(file.parent)) {
+          this.pendingUndoPositions.delete(movedGuid);
+          this.restoreStoredGuidPosition(undoPosition);
+        } else if (pending?.parentPath === newParent) {
           this.pendingDropPlacements.delete(movedGuid);
           this.placeGuidRelative(file.parent, movedGuid, pending.targetGuid, pending.before);
         } else {
@@ -573,8 +609,20 @@ export default class YqOrderDragPlugin extends Plugin {
         const newParent = file.parent?.path || "";
         if (oldParent !== newParent) {
           if (file.parent) await this.ensureFolderGuid(file.parent);
+          const becameFolderNote = file.parent
+            && file.basename === file.parent.name
+            && this.data.folderGuids[file.parent.path] === guid;
+          const undoPosition = this.pendingUndoPositions.get(guid);
           const pending = this.pendingDropPlacements.get(guid);
-          if (pending?.parentPath === newParent) {
+          if (becameFolderNote) {
+            // The note and its folder share one identity. Keep that identity
+            // at the note's former parent position; only remove a hidden
+            // self-reference from the folder's child order.
+            detachFolderNoteFromOrder(this.data.orderByFolder, guid);
+          } else if (undoPosition && undoPosition.folderKey === this.folderKeySync(file.parent)) {
+            this.pendingUndoPositions.delete(guid);
+            this.restoreStoredGuidPosition(undoPosition);
+          } else if (pending?.parentPath === newParent) {
             this.pendingDropPlacements.delete(guid);
             this.placeGuidRelative(file.parent, guid, pending.targetGuid, pending.before);
           } else {
@@ -598,6 +646,27 @@ export default class YqOrderDragPlugin extends Plugin {
     const key = this.folderKeySync(folder);
     relocateGuid(this.data.orderByFolder, key, guid, this.data.settings.newItemPlacement);
     this.data.orderByFolder[key] = moveGuid(this.data.orderByFolder[key], guid, targetGuid, before);
+  }
+
+  private captureItemPosition(item: TAbstractFile, guid: string): StoredGuidPosition {
+    const folderKey = this.folderKeySync(item.parent);
+    const fallbackOrder = item.parent?.children
+      .filter((child) => child instanceof TFolder || child instanceof TFile)
+      .map((child) => this.getItemGuidSync(child))
+      .filter((childGuid): childGuid is string => Boolean(childGuid)) || [];
+    const order = this.data.orderByFolder[folderKey]?.length
+      ? this.data.orderByFolder[folderKey]
+      : fallbackOrder;
+    return { folderKey, guid, ...captureGuidOrderPosition(order, guid) };
+  }
+
+  private restoreStoredGuidPosition(position: StoredGuidPosition): void {
+    removeGuidFromOrders(this.data.orderByFolder, position.guid);
+    this.data.orderByFolder[position.folderKey] = restoreGuidOrderPosition(
+      this.data.orderByFolder[position.folderKey] || [],
+      position.guid,
+      position,
+    );
   }
 
   async requestManifestImport(): Promise<void> {
@@ -1137,10 +1206,163 @@ export default class YqOrderDragPlugin extends Plugin {
     this.clearDropFeedback();
   }
 
+  private rememberDragUndo(record: DragUndoRecord): void {
+    this.lastDragUndo = record;
+    const content = document.createDocumentFragment();
+    content.append("拖拽已完成。 ");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "撤销";
+    button.addEventListener("click", () => {
+      if (this.lastDragUndo === record) void this.undoLastDrag();
+    }, { once: true });
+    content.appendChild(button);
+    new Notice(content, 8000);
+  }
+
+  private async rollbackFolderNoteConversion(
+    createdFolderPath: string | null,
+    targetNoteOriginalPath: string | null,
+    targetNoteMovedPath: string | null,
+    targetNotePosition: StoredGuidPosition | null,
+  ): Promise<boolean> {
+    if (!createdFolderPath || !targetNoteOriginalPath || !targetNoteMovedPath) return true;
+    try {
+      const movedTarget = this.app.vault.getAbstractFileByPath(targetNoteMovedPath);
+      if (movedTarget instanceof TFile && !this.app.vault.getAbstractFileByPath(targetNoteOriginalPath)) {
+        if (targetNotePosition) this.pendingUndoPositions.set(targetNotePosition.guid, targetNotePosition);
+        await this.app.fileManager.renameFile(movedTarget, targetNoteOriginalPath);
+      }
+      const createdFolder = this.app.vault.getAbstractFileByPath(createdFolderPath);
+      if (createdFolder instanceof TFolder) {
+        if (createdFolder.children.length) return false;
+        await this.app.vault.delete(createdFolder, true);
+      }
+      if (targetNotePosition) this.restoreStoredGuidPosition(targetNotePosition);
+      this.queueSave(true);
+      await this.flushSave();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (targetNotePosition) {
+        window.setTimeout(() => this.pendingUndoPositions.delete(targetNotePosition.guid), 1000);
+      }
+    }
+  }
+
+  private async undoLastDrag(): Promise<void> {
+    const record = this.lastDragUndo;
+    if (!record || this.undoInProgress) return;
+
+    const source = this.app.vault.getAbstractFileByPath(record.sourceMovedPath);
+    if (!source || this.getItemGuidSync(source) !== record.sourceGuid) {
+      this.lastDragUndo = null;
+      new Notice("无法撤销：被拖项目已被移动、重命名或删除");
+      return;
+    }
+    const sourceAtOriginal = this.app.vault.getAbstractFileByPath(record.sourceOriginalPath);
+    if (record.sourceMovedPath !== record.sourceOriginalPath && sourceAtOriginal) {
+      new Notice("无法撤销：原位置已存在同名项目");
+      return;
+    }
+
+    const targetNote = record.targetNoteMovedPath
+      ? this.app.vault.getAbstractFileByPath(record.targetNoteMovedPath)
+      : null;
+    if (record.targetNoteMovedPath && (!(targetNote instanceof TFile)
+      || this.getItemGuidSync(targetNote) !== record.targetNoteGuid)) {
+      this.lastDragUndo = null;
+      new Notice("无法撤销：目标文件夹笔记已被移动、重命名或删除");
+      return;
+    }
+    if (record.targetNoteOriginalPath
+      && this.app.vault.getAbstractFileByPath(record.targetNoteOriginalPath)) {
+      new Notice("无法撤销：目标笔记的原位置已存在同名项目");
+      return;
+    }
+    if (record.createdFolderPath) {
+      const createdFolder = this.app.vault.getAbstractFileByPath(record.createdFolderPath);
+      if (!(createdFolder instanceof TFolder)) {
+        this.lastDragUndo = null;
+        new Notice("无法撤销：拖拽创建的文件夹已不存在");
+        return;
+      }
+      const expectedPaths = new Set([record.sourceMovedPath, record.targetNoteMovedPath].filter(Boolean));
+      if (createdFolder.children.some((child) => !expectedPaths.has(child.path))) {
+        new Notice("无法撤销：拖拽创建的文件夹中已有其他项目");
+        return;
+      }
+    }
+
+    this.undoInProgress = true;
+    this.lastDragUndo = null;
+    const currentPosition = this.captureItemPosition(source, record.sourceGuid);
+    let sourceRestored = false;
+    try {
+      if (record.sourceMovedPath !== record.sourceOriginalPath) {
+        this.pendingUndoPositions.set(record.sourceGuid, record.sourcePosition);
+        await this.app.fileManager.renameFile(source as any, record.sourceOriginalPath);
+        sourceRestored = true;
+      }
+      this.restoreStoredGuidPosition(record.sourcePosition);
+
+      if (targetNote instanceof TFile && record.targetNoteOriginalPath && record.targetNotePosition) {
+        this.pendingUndoPositions.set(record.targetNotePosition.guid, record.targetNotePosition);
+        await this.app.fileManager.renameFile(targetNote, record.targetNoteOriginalPath);
+        this.restoreStoredGuidPosition(record.targetNotePosition);
+      }
+
+      if (record.createdFolderPath) {
+        const createdFolder = this.app.vault.getAbstractFileByPath(record.createdFolderPath);
+        if (createdFolder instanceof TFolder) {
+          if (createdFolder.children.length) throw new Error("创建的文件夹不是空文件夹");
+          await this.app.vault.delete(createdFolder, true);
+        }
+        this.restoreStoredGuidPosition(record.sourcePosition);
+        if (record.targetNotePosition) this.restoreStoredGuidPosition(record.targetNotePosition);
+      }
+
+      this.queueSave(true);
+      await this.flushSave();
+      this.refreshExplorer();
+      new Notice("已撤销上一次语雀拖拽");
+    } catch (error) {
+      if (sourceRestored) {
+        const restoredSource = this.app.vault.getAbstractFileByPath(record.sourceOriginalPath);
+        if (restoredSource && !this.app.vault.getAbstractFileByPath(record.sourceMovedPath)) {
+          try {
+            await this.app.fileManager.renameFile(restoredSource as any, record.sourceMovedPath);
+            this.restoreStoredGuidPosition(currentPosition);
+          } catch {
+            // Preserve the original error; reconciliation remains available.
+          }
+        }
+      }
+      this.lastDragUndo = record;
+      new Notice(`撤销失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.undoInProgress = false;
+      window.setTimeout(() => {
+        this.pendingUndoPositions.delete(record.sourceGuid);
+        if (record.targetNoteGuid) this.pendingUndoPositions.delete(record.targetNoteGuid);
+      }, 1000);
+    }
+  }
+
   private async handleDrop(sourcePath: string, targetPath: string, position: DropPosition): Promise<void> {
     const source = this.app.vault.getAbstractFileByPath(sourcePath);
     const target = this.app.vault.getAbstractFileByPath(targetPath);
     if (!source || !target || source.path === target.path) return;
+    const initialSourceGuid = this.getItemGuidSync(source);
+    if (!initialSourceGuid) return;
+    const sourceOriginalPath = source.path;
+    const sourcePosition = this.captureItemPosition(source, initialSourceGuid);
+    let createdFolderPath: string | null = null;
+    let targetNoteOriginalPath: string | null = null;
+    let targetNoteMovedPath: string | null = null;
+    let targetNoteGuid: string | null = null;
+    let targetNotePosition: StoredGuidPosition | null = null;
     let targetFolder = position === "inside" && target instanceof TFolder
       ? target
       : position === "inside" && target instanceof TFile
@@ -1154,14 +1376,29 @@ export default class YqOrderDragPlugin extends Plugin {
     if (!targetFolder && position === "inside" && target instanceof TFile && isMarkdown(target)) {
       if (source instanceof TFolder) return;
       const folderPath = stripMarkdown(target.path);
+      const prospectiveDestination = `${folderPath}/${basename(source.path)}`;
+      if (basename(source.path) === target.name || this.app.vault.getAbstractFileByPath(prospectiveDestination)) {
+        new Notice("目标文件夹中已存在同名文件");
+        return;
+      }
+      targetNoteGuid = this.getItemGuidSync(target);
+      if (!targetNoteGuid) return;
+      targetNoteOriginalPath = target.path;
+      targetNoteMovedPath = `${folderPath}/${target.name}`;
+      targetNotePosition = this.captureItemPosition(target, targetNoteGuid);
       try {
         targetFolder = this.app.vault.getAbstractFileByPath(folderPath) as TFolder | null;
         if (!(targetFolder instanceof TFolder)) {
           targetFolder = await this.app.vault.createFolder(folderPath);
+          createdFolderPath = folderPath;
         }
         await this.ensureFolderGuid(targetFolder);
-        await this.app.fileManager.renameFile(target, `${folderPath}/${target.name}`);
+        await this.app.fileManager.renameFile(target, targetNoteMovedPath);
       } catch (error) {
+        const restored = await this.rollbackFolderNoteConversion(
+          createdFolderPath, targetNoteOriginalPath, targetNoteMovedPath, targetNotePosition,
+        );
+        if (!restored) new Notice("创建失败，且未能完全恢复目标文件夹笔记；请检查文件树");
         new Notice(`创建父文档文件夹失败：${error instanceof Error ? error.message : String(error)}`);
         return;
       }
@@ -1169,7 +1406,7 @@ export default class YqOrderDragPlugin extends Plugin {
 
     if (targetFolder) {
       const destination = `${targetFolder.path}/${basename(source.path)}`;
-      const sourceGuid = this.getItemGuidSync(source);
+      const sourceGuid = initialSourceGuid;
       const blocked = moveBlockReason(
         source.path,
         source instanceof TFolder,
@@ -1187,6 +1424,10 @@ export default class YqOrderDragPlugin extends Plugin {
       try {
         await this.app.fileManager.renameFile(source as any, destination);
       } catch (error) {
+        const restored = await this.rollbackFolderNoteConversion(
+          createdFolderPath, targetNoteOriginalPath, targetNoteMovedPath, targetNotePosition,
+        );
+        if (!restored) new Notice("移动失败，且未能完全恢复目标文件夹笔记；请检查文件树");
         new Notice(`移动失败：${error instanceof Error ? error.message : String(error)}`);
         return;
       }
@@ -1201,10 +1442,21 @@ export default class YqOrderDragPlugin extends Plugin {
       this.queueSave(true);
       await this.flushSave();
       this.refreshExplorer();
+      this.rememberDragUndo({
+        sourceGuid,
+        sourceOriginalPath,
+        sourceMovedPath: destination,
+        sourcePosition,
+        createdFolderPath,
+        targetNoteGuid,
+        targetNoteOriginalPath,
+        targetNoteMovedPath,
+        targetNotePosition,
+      });
       return;
     }
 
-    const sourceGuid = this.getItemGuidSync(source);
+    const sourceGuid = initialSourceGuid;
     const targetGuid = this.getItemGuidSync(target);
     if (!sourceGuid || !targetGuid || !source.parent || !target.parent) return;
 
@@ -1246,6 +1498,17 @@ export default class YqOrderDragPlugin extends Plugin {
       await this.flushSave();
       window.setTimeout(() => this.pendingDropPlacements.delete(sourceGuid), 1000);
       this.refreshExplorer();
+      this.rememberDragUndo({
+        sourceGuid,
+        sourceOriginalPath,
+        sourceMovedPath: destination,
+        sourcePosition,
+        createdFolderPath: null,
+        targetNoteGuid: null,
+        targetNoteOriginalPath: null,
+        targetNoteMovedPath: null,
+        targetNotePosition: null,
+      });
       return;
     }
     const key = this.folderKeySync(source.parent);
@@ -1260,6 +1523,17 @@ export default class YqOrderDragPlugin extends Plugin {
     this.queueSave(true);
     await this.flushSave();
     this.refreshExplorer();
+    this.rememberDragUndo({
+      sourceGuid,
+      sourceOriginalPath,
+      sourceMovedPath: sourceOriginalPath,
+      sourcePosition,
+      createdFolderPath: null,
+      targetNoteGuid: null,
+      targetNoteOriginalPath: null,
+      targetNoteMovedPath: null,
+      targetNotePosition: null,
+    });
   }
 
   refreshExplorer(): void {

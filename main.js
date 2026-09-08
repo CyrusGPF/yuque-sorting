@@ -93,6 +93,29 @@ function moveGuid(order, sourceGuid, targetGuid, insertBefore) {
   next.splice(insertBefore ? targetIndex : targetIndex + 1, 0, sourceGuid);
   return next;
 }
+function captureGuidOrderPosition(order, guid) {
+  const index = order.indexOf(guid);
+  return {
+    previousGuid: index > 0 ? order[index - 1] : null,
+    nextGuid: index >= 0 && index + 1 < order.length ? order[index + 1] : null,
+    originalIndex: index >= 0 ? index : order.length
+  };
+}
+function restoreGuidOrderPosition(order, guid, position) {
+  const next = order.filter((itemGuid) => itemGuid !== guid);
+  const previousIndex = position.previousGuid ? next.indexOf(position.previousGuid) : -1;
+  if (previousIndex >= 0) {
+    next.splice(previousIndex + 1, 0, guid);
+    return next;
+  }
+  const followingIndex = position.nextGuid ? next.indexOf(position.nextGuid) : -1;
+  if (followingIndex >= 0) {
+    next.splice(followingIndex, 0, guid);
+    return next;
+  }
+  next.splice(Math.max(0, Math.min(position.originalIndex, next.length)), 0, guid);
+  return next;
+}
 function removeGuidFromOrders(orderByFolder, guid) {
   let changed = false;
   Object.keys(orderByFolder).forEach((folderKey) => {
@@ -327,6 +350,9 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.dropTargetEl = null;
     this.dropTargetPosition = null;
     this.pendingDropPlacements = /* @__PURE__ */ new Map();
+    this.pendingUndoPositions = /* @__PURE__ */ new Map();
+    this.lastDragUndo = null;
+    this.undoInProgress = false;
   }
   async onload() {
     this.data = this.normalizeData(await this.loadData());
@@ -343,6 +369,15 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
       id: "refresh-yuque-order",
       name: "\u5237\u65B0\u8BED\u96C0\u5F0F\u6587\u4EF6\u987A\u5E8F",
       callback: () => void this.reconcileVault(true)
+    });
+    this.addCommand({
+      id: "undo-last-yuque-drag",
+      name: "\u64A4\u9500\u4E0A\u4E00\u6B21\u8BED\u96C0\u62D6\u62FD",
+      checkCallback: (checking) => {
+        if (!this.lastDragUndo || this.undoInProgress) return false;
+        if (!checking) void this.undoLastDrag();
+        return true;
+      }
     });
     this.addSettingTab(new YqOrderSettingTab(this.app, this));
     this.app.workspace.onLayoutReady(() => void this.boot());
@@ -641,8 +676,12 @@ ${text}`;
       const newParent = ((_a = file.parent) == null ? void 0 : _a.path) || "";
       if (movedGuid && oldParent !== newParent) {
         if (file.parent) await this.ensureFolderGuid(file.parent);
+        const undoPosition = this.pendingUndoPositions.get(movedGuid);
         const pending = this.pendingDropPlacements.get(movedGuid);
-        if ((pending == null ? void 0 : pending.parentPath) === newParent) {
+        if (undoPosition && undoPosition.folderKey === this.folderKeySync(file.parent)) {
+          this.pendingUndoPositions.delete(movedGuid);
+          this.restoreStoredGuidPosition(undoPosition);
+        } else if ((pending == null ? void 0 : pending.parentPath) === newParent) {
           this.pendingDropPlacements.delete(movedGuid);
           this.placeGuidRelative(file.parent, movedGuid, pending.targetGuid, pending.before);
         } else {
@@ -667,8 +706,15 @@ ${text}`;
         const newParent = ((_b = file.parent) == null ? void 0 : _b.path) || "";
         if (oldParent !== newParent) {
           if (file.parent) await this.ensureFolderGuid(file.parent);
+          const becameFolderNote = file.parent && file.basename === file.parent.name && this.data.folderGuids[file.parent.path] === guid;
+          const undoPosition = this.pendingUndoPositions.get(guid);
           const pending = this.pendingDropPlacements.get(guid);
-          if ((pending == null ? void 0 : pending.parentPath) === newParent) {
+          if (becameFolderNote) {
+            detachFolderNoteFromOrder(this.data.orderByFolder, guid);
+          } else if (undoPosition && undoPosition.folderKey === this.folderKeySync(file.parent)) {
+            this.pendingUndoPositions.delete(guid);
+            this.restoreStoredGuidPosition(undoPosition);
+          } else if ((pending == null ? void 0 : pending.parentPath) === newParent) {
             this.pendingDropPlacements.delete(guid);
             this.placeGuidRelative(file.parent, guid, pending.targetGuid, pending.before);
           } else {
@@ -690,6 +736,21 @@ ${text}`;
     const key = this.folderKeySync(folder);
     relocateGuid(this.data.orderByFolder, key, guid, this.data.settings.newItemPlacement);
     this.data.orderByFolder[key] = moveGuid(this.data.orderByFolder[key], guid, targetGuid, before);
+  }
+  captureItemPosition(item, guid) {
+    var _a, _b;
+    const folderKey = this.folderKeySync(item.parent);
+    const fallbackOrder = ((_a = item.parent) == null ? void 0 : _a.children.filter((child) => child instanceof import_obsidian.TFolder || child instanceof import_obsidian.TFile).map((child) => this.getItemGuidSync(child)).filter((childGuid) => Boolean(childGuid))) || [];
+    const order = ((_b = this.data.orderByFolder[folderKey]) == null ? void 0 : _b.length) ? this.data.orderByFolder[folderKey] : fallbackOrder;
+    return { folderKey, guid, ...captureGuidOrderPosition(order, guid) };
+  }
+  restoreStoredGuidPosition(position) {
+    removeGuidFromOrders(this.data.orderByFolder, position.guid);
+    this.data.orderByFolder[position.folderKey] = restoreGuidOrderPosition(
+      this.data.orderByFolder[position.folderKey] || [],
+      position.guid,
+      position
+    );
   }
   async requestManifestImport() {
     const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
@@ -1164,30 +1225,182 @@ ${text}`;
     (_a = this.getExplorerContainer()) == null ? void 0 : _a.querySelectorAll(".yq-order-drag-source").forEach((el) => el.classList.remove("yq-order-drag-source"));
     this.clearDropFeedback();
   }
+  rememberDragUndo(record) {
+    this.lastDragUndo = record;
+    const content = document.createDocumentFragment();
+    content.append("\u62D6\u62FD\u5DF2\u5B8C\u6210\u3002 ");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "\u64A4\u9500";
+    button.addEventListener("click", () => {
+      if (this.lastDragUndo === record) void this.undoLastDrag();
+    }, { once: true });
+    content.appendChild(button);
+    new import_obsidian.Notice(content, 8e3);
+  }
+  async rollbackFolderNoteConversion(createdFolderPath, targetNoteOriginalPath, targetNoteMovedPath, targetNotePosition) {
+    if (!createdFolderPath || !targetNoteOriginalPath || !targetNoteMovedPath) return true;
+    try {
+      const movedTarget = this.app.vault.getAbstractFileByPath(targetNoteMovedPath);
+      if (movedTarget instanceof import_obsidian.TFile && !this.app.vault.getAbstractFileByPath(targetNoteOriginalPath)) {
+        if (targetNotePosition) this.pendingUndoPositions.set(targetNotePosition.guid, targetNotePosition);
+        await this.app.fileManager.renameFile(movedTarget, targetNoteOriginalPath);
+      }
+      const createdFolder = this.app.vault.getAbstractFileByPath(createdFolderPath);
+      if (createdFolder instanceof import_obsidian.TFolder) {
+        if (createdFolder.children.length) return false;
+        await this.app.vault.delete(createdFolder, true);
+      }
+      if (targetNotePosition) this.restoreStoredGuidPosition(targetNotePosition);
+      this.queueSave(true);
+      await this.flushSave();
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      if (targetNotePosition) {
+        window.setTimeout(() => this.pendingUndoPositions.delete(targetNotePosition.guid), 1e3);
+      }
+    }
+  }
+  async undoLastDrag() {
+    const record = this.lastDragUndo;
+    if (!record || this.undoInProgress) return;
+    const source = this.app.vault.getAbstractFileByPath(record.sourceMovedPath);
+    if (!source || this.getItemGuidSync(source) !== record.sourceGuid) {
+      this.lastDragUndo = null;
+      new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u88AB\u62D6\u9879\u76EE\u5DF2\u88AB\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664");
+      return;
+    }
+    const sourceAtOriginal = this.app.vault.getAbstractFileByPath(record.sourceOriginalPath);
+    if (record.sourceMovedPath !== record.sourceOriginalPath && sourceAtOriginal) {
+      new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u539F\u4F4D\u7F6E\u5DF2\u5B58\u5728\u540C\u540D\u9879\u76EE");
+      return;
+    }
+    const targetNote = record.targetNoteMovedPath ? this.app.vault.getAbstractFileByPath(record.targetNoteMovedPath) : null;
+    if (record.targetNoteMovedPath && (!(targetNote instanceof import_obsidian.TFile) || this.getItemGuidSync(targetNote) !== record.targetNoteGuid)) {
+      this.lastDragUndo = null;
+      new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u76EE\u6807\u6587\u4EF6\u5939\u7B14\u8BB0\u5DF2\u88AB\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664");
+      return;
+    }
+    if (record.targetNoteOriginalPath && this.app.vault.getAbstractFileByPath(record.targetNoteOriginalPath)) {
+      new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u76EE\u6807\u7B14\u8BB0\u7684\u539F\u4F4D\u7F6E\u5DF2\u5B58\u5728\u540C\u540D\u9879\u76EE");
+      return;
+    }
+    if (record.createdFolderPath) {
+      const createdFolder = this.app.vault.getAbstractFileByPath(record.createdFolderPath);
+      if (!(createdFolder instanceof import_obsidian.TFolder)) {
+        this.lastDragUndo = null;
+        new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u62D6\u62FD\u521B\u5EFA\u7684\u6587\u4EF6\u5939\u5DF2\u4E0D\u5B58\u5728");
+        return;
+      }
+      const expectedPaths = new Set([record.sourceMovedPath, record.targetNoteMovedPath].filter(Boolean));
+      if (createdFolder.children.some((child) => !expectedPaths.has(child.path))) {
+        new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u62D6\u62FD\u521B\u5EFA\u7684\u6587\u4EF6\u5939\u4E2D\u5DF2\u6709\u5176\u4ED6\u9879\u76EE");
+        return;
+      }
+    }
+    this.undoInProgress = true;
+    this.lastDragUndo = null;
+    const currentPosition = this.captureItemPosition(source, record.sourceGuid);
+    let sourceRestored = false;
+    try {
+      if (record.sourceMovedPath !== record.sourceOriginalPath) {
+        this.pendingUndoPositions.set(record.sourceGuid, record.sourcePosition);
+        await this.app.fileManager.renameFile(source, record.sourceOriginalPath);
+        sourceRestored = true;
+      }
+      this.restoreStoredGuidPosition(record.sourcePosition);
+      if (targetNote instanceof import_obsidian.TFile && record.targetNoteOriginalPath && record.targetNotePosition) {
+        this.pendingUndoPositions.set(record.targetNotePosition.guid, record.targetNotePosition);
+        await this.app.fileManager.renameFile(targetNote, record.targetNoteOriginalPath);
+        this.restoreStoredGuidPosition(record.targetNotePosition);
+      }
+      if (record.createdFolderPath) {
+        const createdFolder = this.app.vault.getAbstractFileByPath(record.createdFolderPath);
+        if (createdFolder instanceof import_obsidian.TFolder) {
+          if (createdFolder.children.length) throw new Error("\u521B\u5EFA\u7684\u6587\u4EF6\u5939\u4E0D\u662F\u7A7A\u6587\u4EF6\u5939");
+          await this.app.vault.delete(createdFolder, true);
+        }
+        this.restoreStoredGuidPosition(record.sourcePosition);
+        if (record.targetNotePosition) this.restoreStoredGuidPosition(record.targetNotePosition);
+      }
+      this.queueSave(true);
+      await this.flushSave();
+      this.refreshExplorer();
+      new import_obsidian.Notice("\u5DF2\u64A4\u9500\u4E0A\u4E00\u6B21\u8BED\u96C0\u62D6\u62FD");
+    } catch (error) {
+      if (sourceRestored) {
+        const restoredSource = this.app.vault.getAbstractFileByPath(record.sourceOriginalPath);
+        if (restoredSource && !this.app.vault.getAbstractFileByPath(record.sourceMovedPath)) {
+          try {
+            await this.app.fileManager.renameFile(restoredSource, record.sourceMovedPath);
+            this.restoreStoredGuidPosition(currentPosition);
+          } catch (e) {
+          }
+        }
+      }
+      this.lastDragUndo = record;
+      new import_obsidian.Notice(`\u64A4\u9500\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.undoInProgress = false;
+      window.setTimeout(() => {
+        this.pendingUndoPositions.delete(record.sourceGuid);
+        if (record.targetNoteGuid) this.pendingUndoPositions.delete(record.targetNoteGuid);
+      }, 1e3);
+    }
+  }
   async handleDrop(sourcePath, targetPath, position) {
     var _a;
     const source = this.app.vault.getAbstractFileByPath(sourcePath);
     const target = this.app.vault.getAbstractFileByPath(targetPath);
     if (!source || !target || source.path === target.path) return;
+    const initialSourceGuid = this.getItemGuidSync(source);
+    if (!initialSourceGuid) return;
+    const sourceOriginalPath = source.path;
+    const sourcePosition = this.captureItemPosition(source, initialSourceGuid);
+    let createdFolderPath = null;
+    let targetNoteOriginalPath = null;
+    let targetNoteMovedPath = null;
+    let targetNoteGuid = null;
+    let targetNotePosition = null;
     let targetFolder = position === "inside" && target instanceof import_obsidian.TFolder ? target : position === "inside" && target instanceof import_obsidian.TFile ? this.findFolderForNote(target) : null;
     if (!targetFolder && position === "inside" && target instanceof import_obsidian.TFile && isMarkdown(target)) {
       if (source instanceof import_obsidian.TFolder) return;
       const folderPath = stripMarkdown(target.path);
+      const prospectiveDestination = `${folderPath}/${basename(source.path)}`;
+      if (basename(source.path) === target.name || this.app.vault.getAbstractFileByPath(prospectiveDestination)) {
+        new import_obsidian.Notice("\u76EE\u6807\u6587\u4EF6\u5939\u4E2D\u5DF2\u5B58\u5728\u540C\u540D\u6587\u4EF6");
+        return;
+      }
+      targetNoteGuid = this.getItemGuidSync(target);
+      if (!targetNoteGuid) return;
+      targetNoteOriginalPath = target.path;
+      targetNoteMovedPath = `${folderPath}/${target.name}`;
+      targetNotePosition = this.captureItemPosition(target, targetNoteGuid);
       try {
         targetFolder = this.app.vault.getAbstractFileByPath(folderPath);
         if (!(targetFolder instanceof import_obsidian.TFolder)) {
           targetFolder = await this.app.vault.createFolder(folderPath);
+          createdFolderPath = folderPath;
         }
         await this.ensureFolderGuid(targetFolder);
-        await this.app.fileManager.renameFile(target, `${folderPath}/${target.name}`);
+        await this.app.fileManager.renameFile(target, targetNoteMovedPath);
       } catch (error) {
+        const restored = await this.rollbackFolderNoteConversion(
+          createdFolderPath,
+          targetNoteOriginalPath,
+          targetNoteMovedPath,
+          targetNotePosition
+        );
+        if (!restored) new import_obsidian.Notice("\u521B\u5EFA\u5931\u8D25\uFF0C\u4E14\u672A\u80FD\u5B8C\u5168\u6062\u590D\u76EE\u6807\u6587\u4EF6\u5939\u7B14\u8BB0\uFF1B\u8BF7\u68C0\u67E5\u6587\u4EF6\u6811");
         new import_obsidian.Notice(`\u521B\u5EFA\u7236\u6587\u6863\u6587\u4EF6\u5939\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         return;
       }
     }
     if (targetFolder) {
       const destination = `${targetFolder.path}/${basename(source.path)}`;
-      const sourceGuid2 = this.getItemGuidSync(source);
+      const sourceGuid2 = initialSourceGuid;
       const blocked = moveBlockReason(
         source.path,
         source instanceof import_obsidian.TFolder,
@@ -1205,6 +1418,13 @@ ${text}`;
       try {
         await this.app.fileManager.renameFile(source, destination);
       } catch (error) {
+        const restored = await this.rollbackFolderNoteConversion(
+          createdFolderPath,
+          targetNoteOriginalPath,
+          targetNoteMovedPath,
+          targetNotePosition
+        );
+        if (!restored) new import_obsidian.Notice("\u79FB\u52A8\u5931\u8D25\uFF0C\u4E14\u672A\u80FD\u5B8C\u5168\u6062\u590D\u76EE\u6807\u6587\u4EF6\u5939\u7B14\u8BB0\uFF1B\u8BF7\u68C0\u67E5\u6587\u4EF6\u6811");
         new import_obsidian.Notice(`\u79FB\u52A8\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         return;
       }
@@ -1219,9 +1439,20 @@ ${text}`;
       this.queueSave(true);
       await this.flushSave();
       this.refreshExplorer();
+      this.rememberDragUndo({
+        sourceGuid: sourceGuid2,
+        sourceOriginalPath,
+        sourceMovedPath: destination,
+        sourcePosition,
+        createdFolderPath,
+        targetNoteGuid,
+        targetNoteOriginalPath,
+        targetNoteMovedPath,
+        targetNotePosition
+      });
       return;
     }
-    const sourceGuid = this.getItemGuidSync(source);
+    const sourceGuid = initialSourceGuid;
     const targetGuid = this.getItemGuidSync(target);
     if (!sourceGuid || !targetGuid || !source.parent || !target.parent) return;
     if (source.parent.path !== target.parent.path) {
@@ -1257,6 +1488,17 @@ ${text}`;
       await this.flushSave();
       window.setTimeout(() => this.pendingDropPlacements.delete(sourceGuid), 1e3);
       this.refreshExplorer();
+      this.rememberDragUndo({
+        sourceGuid,
+        sourceOriginalPath,
+        sourceMovedPath: destination,
+        sourcePosition,
+        createdFolderPath: null,
+        targetNoteGuid: null,
+        targetNoteOriginalPath: null,
+        targetNoteMovedPath: null,
+        targetNotePosition: null
+      });
       return;
     }
     const key = this.folderKeySync(source.parent);
@@ -1266,6 +1508,17 @@ ${text}`;
     this.queueSave(true);
     await this.flushSave();
     this.refreshExplorer();
+    this.rememberDragUndo({
+      sourceGuid,
+      sourceOriginalPath,
+      sourceMovedPath: sourceOriginalPath,
+      sourcePosition,
+      createdFolderPath: null,
+      targetNoteGuid: null,
+      targetNoteOriginalPath: null,
+      targetNoteMovedPath: null,
+      targetNotePosition: null
+    });
   }
   refreshExplorer() {
     if (this.explorerRefreshFrame !== null) return;
