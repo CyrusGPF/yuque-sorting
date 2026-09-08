@@ -29,7 +29,7 @@ import {
   sanitizePortableName,
   sortEntries,
 } from "./src/order-utils";
-import { DropPosition, dropPositionForPointer } from "./src/drag-utils";
+import { DropPosition, dropPositionForPointer, moveBlockReason } from "./src/drag-utils";
 
 const MANIFEST_NAME = "_yuque_order.json";
 
@@ -150,13 +150,23 @@ export default class YqOrderDragPlugin extends Plugin {
   private guidPromises = new Map<string, Promise<string>>();
   private saveTimer: number | null = null;
   private savePromise: Promise<void> = Promise.resolve();
+  private saveDirty = false;
   private explorerView: any = null;
+  private explorerContainer: HTMLElement | null = null;
+  private explorerObserver: MutationObserver | null = null;
+  private explorerWaitObserver: MutationObserver | null = null;
   private restoreExplorerPatch: (() => void) | null = null;
+  private explorerPatchActive = false;
+  private explorerRefreshFrame: number | null = null;
   private domOrderFrame: number | null = null;
   private explorerSetup = false;
   private manifestNoticeShown = false;
   private dragSourcePath = "";
   private dragHintEl: HTMLElement | null = null;
+  private dragHintWidth = 0;
+  private dragHintHeight = 0;
+  private dropTargetEl: HTMLElement | null = null;
+  private dropTargetPosition: DropPosition | null = null;
   private pendingDropPlacements = new Map<string, PendingDropPlacement>();
 
   async onload(): Promise<void> {
@@ -165,6 +175,7 @@ export default class YqOrderDragPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleRename(file, oldPath)));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.setupExplorer()));
 
     this.addCommand({
       id: "import-yuque-order-manifest",
@@ -196,9 +207,15 @@ export default class YqOrderDragPlugin extends Plugin {
 
   onunload(): void {
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+    if (this.saveDirty) void this.enqueueDirtySave();
+    if (this.explorerRefreshFrame !== null) window.cancelAnimationFrame(this.explorerRefreshFrame);
     if (this.domOrderFrame !== null) window.cancelAnimationFrame(this.domOrderFrame);
+    this.explorerObserver?.disconnect();
+    this.explorerWaitObserver?.disconnect();
+    this.clearDragState();
     this.restoreExplorerPatch?.();
     this.restoreExplorerPatch = null;
+    this.explorerPatchActive = false;
   }
 
   normalizeData(saved: Partial<OrderData> | null): OrderData {
@@ -236,25 +253,54 @@ export default class YqOrderDragPlugin extends Plugin {
 
   private queueSave(force = false): void {
     if (!force && !this.data.settings.persistOrderOnCreateDelete) return;
+    this.saveDirty = true;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
-      this.savePromise = this.savePromise.then(() => this.saveData(this.data));
+      void this.enqueueDirtySave();
     }, 250);
+  }
+
+  private enqueueDirtySave(): Promise<void> {
+    this.savePromise = this.savePromise
+      .catch((error) => {
+        console.error("[Yuque Order Drag] Previous data save failed; retrying.", error);
+      })
+      .then(async () => {
+        while (this.saveDirty) {
+          this.saveDirty = false;
+          try {
+            await this.saveData(this.data);
+          } catch (error) {
+            this.saveDirty = true;
+            console.error("[Yuque Order Drag] Failed to save plugin data.", error);
+            break;
+          }
+        }
+      });
+    return this.savePromise;
   }
 
   private async flushSave(): Promise<void> {
     if (this.saveTimer !== null) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
-      this.savePromise = this.savePromise.then(() => this.saveData(this.data));
     }
+    if (this.saveDirty) await this.enqueueDirtySave();
     await this.savePromise;
   }
 
+  private async forceSave(): Promise<void> {
+    if (this.saveTimer !== null) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.saveDirty = true;
+    await this.enqueueDirtySave();
+  }
+
   async saveSettings(): Promise<void> {
-    await this.flushSave();
-    await this.saveData(this.data);
+    await this.forceSave();
   }
 
   async reconcileVault(forceRefresh: boolean): Promise<void> {
@@ -275,10 +321,9 @@ export default class YqOrderDragPlugin extends Plugin {
     // pruning here would turn late arrivals into new bottom-placed items.
     // Confirmed delete events perform the destructive cleanup instead.
     for (const folder of folders) this.reconcileFolder(folder);
-    await this.flushSave();
     // The full scan also creates folder identities and initial order lists;
     // persist that reconciliation even when event persistence is disabled.
-    await this.saveData(this.data);
+    await this.forceSave();
     if (forceRefresh) this.refreshExplorer();
   }
 
@@ -794,8 +839,7 @@ export default class YqOrderDragPlugin extends Plugin {
     }
 
     if (seeded) {
-      await this.flushSave();
-      await this.saveData(this.data);
+      await this.forceSave();
       this.refreshExplorer();
       new Notice("已从语雀清单导入顺序");
     } else {
@@ -879,6 +923,7 @@ export default class YqOrderDragPlugin extends Plugin {
         }
       };
       this.restoreExplorerPatch = () => { prototype.getSortedFolderItems = original; };
+      this.explorerPatchActive = true;
     } catch (error) {
       if (!this.manifestNoticeShown) {
         this.manifestNoticeShown = true;
@@ -888,7 +933,6 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private setupExplorer(): void {
-    if (this.explorerSetup) return;
     const view = this.app.workspace.getLeavesOfType("file-explorer")[0]?.view;
     const container = view?.containerEl
       || document.querySelector<HTMLElement>(".nav-files-container");
@@ -897,20 +941,28 @@ export default class YqOrderDragPlugin extends Plugin {
       // still rendering, or reopened later). Wait for it like flexplorer
       // does, otherwise the sort patch never applies and the explorer stays
       // in Obsidian's default alphabetical order.
-      const observer = new MutationObserver(() => {
+      if (this.explorerWaitObserver) return;
+      this.explorerWaitObserver = new MutationObserver(() => {
         if (!this.app.workspace.getLeavesOfType("file-explorer")[0]?.view) return;
-        observer.disconnect();
+        this.explorerWaitObserver?.disconnect();
+        this.explorerWaitObserver = null;
         this.setupExplorer();
       });
-      observer.observe(document.body, { childList: true, subtree: true });
-      this.register(() => observer.disconnect());
+      this.explorerWaitObserver.observe(document.body, { childList: true, subtree: true });
       return;
     }
-    if (!this.explorerView) this.explorerView = view;
-    this.explorerSetup = true;
+    this.explorerWaitObserver?.disconnect();
+    this.explorerWaitObserver = null;
+    const explorerChanged = this.explorerView !== view || this.explorerContainer !== container;
+    this.explorerView = view;
     this.patchFileExplorer();
-    this.installDragHandlers();
-    this.refreshExplorer();
+    if (!this.explorerSetup) {
+      this.explorerSetup = true;
+      this.installDragHandlers();
+    } else {
+      this.observeExplorerContainer(container);
+    }
+    if (explorerChanged) this.refreshExplorer();
   }
 
   private getExplorerContainer(): HTMLElement | null {
@@ -965,54 +1017,55 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private showDropFeedback(targetEl: HTMLElement, position: DropPosition, clientX: number, clientY: number): void {
-    this.clearDropTargets();
-    targetEl.classList.add(`yq-order-drop-${position}`);
+    const targetChanged = this.dropTargetEl !== targetEl || this.dropTargetPosition !== position;
+    if (targetChanged) {
+      this.clearDropTargets();
+      this.dropTargetEl = targetEl;
+      this.dropTargetPosition = position;
+      targetEl.classList.add(`yq-order-drop-${position}`);
+    }
 
     if (!this.dragHintEl) {
       this.dragHintEl = document.createElement("div");
       this.dragHintEl.className = "yq-order-drag-hint";
       document.body.appendChild(this.dragHintEl);
     }
-    const targetName = this.dropSurface(targetEl).textContent?.trim() || this.pathFromElement(targetEl);
-    const action = position === "before" ? "插入到上方" : position === "after" ? "插入到下方" : "移入";
-    this.dragHintEl.textContent = `${action}：${targetName}`;
-    const hintRect = this.dragHintEl.getBoundingClientRect();
-    const left = Math.max(8, Math.min(clientX + 14, window.innerWidth - hintRect.width - 8));
+    if (targetChanged || !this.dragHintEl.textContent) {
+      const targetName = this.dropSurface(targetEl).textContent?.trim() || this.pathFromElement(targetEl);
+      const action = position === "before" ? "插入到上方" : position === "after" ? "插入到下方" : "移入";
+      this.dragHintEl.textContent = `${action}：${targetName}`;
+      const hintRect = this.dragHintEl.getBoundingClientRect();
+      this.dragHintWidth = hintRect.width;
+      this.dragHintHeight = hintRect.height;
+    }
+    const left = Math.max(8, Math.min(clientX + 14, window.innerWidth - this.dragHintWidth - 8));
     const below = clientY + 18;
-    const top = below + hintRect.height <= window.innerHeight - 8
+    const top = below + this.dragHintHeight <= window.innerHeight - 8
       ? below
-      : Math.max(8, clientY - hintRect.height - 14);
+      : Math.max(8, clientY - this.dragHintHeight - 14);
     this.dragHintEl.style.left = `${left}px`;
     this.dragHintEl.style.top = `${top}px`;
   }
 
   private clearDropTargets(): void {
-    document.querySelectorAll(".yq-order-drop-before, .yq-order-drop-inside, .yq-order-drop-after")
-      .forEach((element) => element.classList.remove(
-        "yq-order-drop-before", "yq-order-drop-inside", "yq-order-drop-after",
-      ));
+    this.dropTargetEl?.classList.remove(
+      "yq-order-drop-before", "yq-order-drop-inside", "yq-order-drop-after",
+    );
+    this.dropTargetEl = null;
+    this.dropTargetPosition = null;
   }
 
   private clearDropFeedback(): void {
     this.clearDropTargets();
     this.dragHintEl?.remove();
     this.dragHintEl = null;
+    this.dragHintWidth = 0;
+    this.dragHintHeight = 0;
   }
 
   private installDragHandlers(): void {
     const explorerContainer = this.getExplorerContainer() || undefined;
-    if (explorerContainer) {
-      const markDraggable = () => explorerContainer.querySelectorAll<HTMLElement>(".nav-file, .nav-folder")
-        .forEach((element) => element.setAttribute("draggable", "true"));
-      markDraggable();
-      const observer = new MutationObserver(() => {
-        markDraggable();
-        this.scheduleDomOrder();
-      });
-      observer.observe(explorerContainer, { childList: true, subtree: true });
-      this.register(() => observer.disconnect());
-      this.scheduleDomOrder();
-    }
+    if (explorerContainer) this.observeExplorerContainer(explorerContainer);
     this.registerDomEvent(document, "dragstart", (event) => {
       if (!this.data.settings.enableDrag) return;
       const item = this.explorerItem(event.target);
@@ -1054,15 +1107,33 @@ export default class YqOrderDragPlugin extends Plugin {
     this.registerDomEvent(document, "dragend", () => this.clearDragState(), true);
   }
 
+  private observeExplorerContainer(container: HTMLElement): void {
+    if (this.explorerContainer === container && this.explorerObserver) return;
+    this.explorerObserver?.disconnect();
+    this.explorerContainer = container;
+
+    const markDraggable = (root: ParentNode) => {
+      if (root instanceof HTMLElement && root.matches(".nav-file, .nav-folder")) {
+        root.setAttribute("draggable", "true");
+      }
+      root.querySelectorAll<HTMLElement>(".nav-file, .nav-folder")
+        .forEach((element) => element.setAttribute("draggable", "true"));
+    };
+    markDraggable(container);
+    this.explorerObserver = new MutationObserver((records) => {
+      records.forEach((record) => record.addedNodes.forEach((node) => {
+        if (node instanceof HTMLElement) markDraggable(node);
+      }));
+      this.scheduleDomOrder();
+    });
+    this.explorerObserver.observe(container, { childList: true, subtree: true });
+    this.scheduleDomOrder();
+  }
+
   private clearDragState(): void {
     this.dragSourcePath = "";
-    document.querySelectorAll(
-      ".yq-order-drag-source, .yq-order-drop-before, .yq-order-drop-inside, .yq-order-drop-after",
-    ).forEach((el) => {
-      el.classList.remove(
-        "yq-order-drag-source", "yq-order-drop-before", "yq-order-drop-inside", "yq-order-drop-after",
-      );
-    });
+    this.getExplorerContainer()?.querySelectorAll(".yq-order-drag-source")
+      .forEach((el) => el.classList.remove("yq-order-drag-source"));
     this.clearDropFeedback();
   }
 
@@ -1096,20 +1167,39 @@ export default class YqOrderDragPlugin extends Plugin {
       }
     }
 
-    if (targetFolder && targetFolder !== source && !targetFolder.path.startsWith(`${source.path}/`)) {
+    if (targetFolder) {
       const destination = `${targetFolder.path}/${basename(source.path)}`;
-      if (this.app.vault.getAbstractFileByPath(destination)) {
+      const sourceGuid = this.getItemGuidSync(source);
+      const blocked = moveBlockReason(
+        source.path,
+        source instanceof TFolder,
+        targetFolder.path,
+        Boolean(this.app.vault.getAbstractFileByPath(destination)),
+      );
+      if (blocked === "self-or-descendant") {
+        new Notice("不能把文件夹移动到它自己的子目录中");
+        return;
+      }
+      if (blocked === "conflict") {
         new Notice("目标文件夹中已存在同名文件");
         return;
       }
-      const guid = this.getItemGuidSync(source);
-      if (guid) removeGuidFromOrders(this.data.orderByFolder, guid);
       try {
         await this.app.fileManager.renameFile(source as any, destination);
       } catch (error) {
         new Notice(`移动失败：${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      if (sourceGuid) {
+        relocateGuid(
+          this.data.orderByFolder,
+          this.folderKeySync(targetFolder),
+          sourceGuid,
+          this.data.settings.newItemPlacement,
+        );
       }
       this.queueSave(true);
+      await this.flushSave();
       this.refreshExplorer();
       return;
     }
@@ -1119,14 +1209,20 @@ export default class YqOrderDragPlugin extends Plugin {
     if (!sourceGuid || !targetGuid || !source.parent || !target.parent) return;
 
     if (source.parent.path !== target.parent.path) {
-      if (target.parent === source || target.parent.path.startsWith(`${source.path}/`)) {
-        new Notice("不能把文件夹移动到它自己的子目录中");
-        return;
-      }
       const destination = target.parent.path
         ? `${target.parent.path}/${basename(source.path)}`
         : basename(source.path);
-      if (this.app.vault.getAbstractFileByPath(destination)) {
+      const blocked = moveBlockReason(
+        source.path,
+        source instanceof TFolder,
+        target.parent.path,
+        Boolean(this.app.vault.getAbstractFileByPath(destination)),
+      );
+      if (blocked === "self-or-descendant") {
+        new Notice("不能把文件夹移动到它自己的子目录中");
+        return;
+      }
+      if (blocked === "conflict") {
         new Notice("目标目录中已存在同名文件");
         return;
       }
@@ -1140,7 +1236,16 @@ export default class YqOrderDragPlugin extends Plugin {
       } catch (error) {
         this.pendingDropPlacements.delete(sourceGuid);
         new Notice(`移动失败：${error instanceof Error ? error.message : String(error)}`);
+        return;
       }
+      // The vault rename event normally consumes the pending placement. Apply
+      // the same idempotent operation here as well so an explicit drop is
+      // persisted even when event persistence is disabled or delayed.
+      this.placeGuidRelative(target.parent, sourceGuid, targetGuid, position === "before");
+      this.queueSave(true);
+      await this.flushSave();
+      window.setTimeout(() => this.pendingDropPlacements.delete(sourceGuid), 1000);
+      this.refreshExplorer();
       return;
     }
     const key = this.folderKeySync(source.parent);
@@ -1158,6 +1263,14 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   refreshExplorer(): void {
+    if (this.explorerRefreshFrame !== null) return;
+    this.explorerRefreshFrame = window.requestAnimationFrame(() => {
+      this.explorerRefreshFrame = null;
+      this.performExplorerRefresh();
+    });
+  }
+
+  private performExplorerRefresh(): void {
     try {
       // Like flexplorer, re-sort the live FileExplorerView; `sort()` is the
       // method that actually re-runs getSortedFolderItems and re-renders.
@@ -1180,6 +1293,7 @@ export default class YqOrderDragPlugin extends Plugin {
    * while all authoritative order data remains in data.json.
    */
   private scheduleDomOrder(): void {
+    if (this.explorerPatchActive) return;
     if (this.domOrderFrame !== null) return;
     this.domOrderFrame = window.requestAnimationFrame(() => {
       this.domOrderFrame = null;

@@ -1,4 +1,5 @@
 export type DropPosition = "before" | "inside" | "after";
+export type MoveBlockReason = "self-or-descendant" | "conflict";
 
 /**
  * Split a file-tree title row into explicit drop zones. Nestable targets keep
@@ -15,4 +16,18 @@ export function dropPositionForPointer(
   if (ratio < 0.3) return "before";
   if (ratio > 0.7) return "after";
   return "inside";
+}
+
+/** Validate a filesystem move before any identity or order state is changed. */
+export function moveBlockReason(
+  sourcePath: string,
+  sourceIsFolder: boolean,
+  targetFolderPath: string,
+  destinationExists: boolean,
+): MoveBlockReason | null {
+  if (sourceIsFolder
+    && (targetFolderPath === sourcePath || targetFolderPath.startsWith(`${sourcePath}/`))) {
+    return "self-or-descendant";
+  }
+  return destinationExists ? "conflict" : null;
 }

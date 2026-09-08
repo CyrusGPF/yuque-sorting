@@ -27,6 +27,11 @@ var import_obsidian = require("obsidian");
 
 // src/order-utils.ts
 var ROOT_FOLDER_KEY = "__root__";
+var entryNameCollator = new Intl.Collator(void 0, {
+  numeric: true,
+  sensitivity: "base"
+});
+var rankByOrder = /* @__PURE__ */ new WeakMap();
 function sanitizePortableName(name) {
   if (!name) return "";
   let result = name.normalize("NFKC").replace(/[\u0000-\u001f\u007f\u200B-\u200D\uFEFF]/g, "").replace(/[\\/<>:"|?*]/g, "_").replace(/\s+/g, "_").replace(/_+/g, "_").replace(/[. ]+$/g, "").trim().replace(/^\.+|\.+$/g, "");
@@ -45,13 +50,17 @@ function normalizeGuid(value) {
   return guid ? guid : null;
 }
 function compareEntryNames(a, b) {
-  return a.name.localeCompare(b.name, void 0, { numeric: true, sensitivity: "base" });
+  return entryNameCollator.compare(a.name, b.name);
 }
 function sortEntries(entries, savedOrder, guidOf, fallback = "name-last") {
-  const rank = /* @__PURE__ */ new Map();
-  savedOrder.forEach((guid, index) => {
-    if (!rank.has(guid)) rank.set(guid, index);
-  });
+  let rank = rankByOrder.get(savedOrder);
+  if (!rank) {
+    rank = /* @__PURE__ */ new Map();
+    savedOrder.forEach((guid, index) => {
+      if (!rank.has(guid)) rank.set(guid, index);
+    });
+    rankByOrder.set(savedOrder, rank);
+  }
   return entries.map((entry, originalIndex) => ({ entry, originalIndex, guid: guidOf(entry) })).sort((a, b) => {
     const ar = a.guid ? rank.get(a.guid) : void 0;
     const br = b.guid ? rank.get(b.guid) : void 0;
@@ -215,6 +224,12 @@ function dropPositionForPointer(clientY, top, height, canNest) {
   if (ratio > 0.7) return "after";
   return "inside";
 }
+function moveBlockReason(sourcePath, sourceIsFolder, targetFolderPath, destinationExists) {
+  if (sourceIsFolder && (targetFolderPath === sourcePath || targetFolderPath.startsWith(`${sourcePath}/`))) {
+    return "self-or-descendant";
+  }
+  return destinationExists ? "conflict" : null;
+}
 
 // main.ts
 var MANIFEST_NAME = "_yuque_order.json";
@@ -294,13 +309,23 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.guidPromises = /* @__PURE__ */ new Map();
     this.saveTimer = null;
     this.savePromise = Promise.resolve();
+    this.saveDirty = false;
     this.explorerView = null;
+    this.explorerContainer = null;
+    this.explorerObserver = null;
+    this.explorerWaitObserver = null;
     this.restoreExplorerPatch = null;
+    this.explorerPatchActive = false;
+    this.explorerRefreshFrame = null;
     this.domOrderFrame = null;
     this.explorerSetup = false;
     this.manifestNoticeShown = false;
     this.dragSourcePath = "";
     this.dragHintEl = null;
+    this.dragHintWidth = 0;
+    this.dragHintHeight = 0;
+    this.dropTargetEl = null;
+    this.dropTargetPosition = null;
     this.pendingDropPlacements = /* @__PURE__ */ new Map();
   }
   async onload() {
@@ -308,6 +333,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleRename(file, oldPath)));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.setupExplorer()));
     this.addCommand({
       id: "import-yuque-order-manifest",
       name: "\u5BFC\u5165/\u91CD\u540C\u6B65\u8BED\u96C0\u987A\u5E8F\u6E05\u5355",
@@ -327,11 +353,17 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.refreshExplorer();
   }
   onunload() {
-    var _a;
+    var _a, _b, _c;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+    if (this.saveDirty) void this.enqueueDirtySave();
+    if (this.explorerRefreshFrame !== null) window.cancelAnimationFrame(this.explorerRefreshFrame);
     if (this.domOrderFrame !== null) window.cancelAnimationFrame(this.domOrderFrame);
-    (_a = this.restoreExplorerPatch) == null ? void 0 : _a.call(this);
+    (_a = this.explorerObserver) == null ? void 0 : _a.disconnect();
+    (_b = this.explorerWaitObserver) == null ? void 0 : _b.disconnect();
+    this.clearDragState();
+    (_c = this.restoreExplorerPatch) == null ? void 0 : _c.call(this);
     this.restoreExplorerPatch = null;
+    this.explorerPatchActive = false;
   }
   normalizeData(saved) {
     const savedSettings = (saved == null ? void 0 : saved.settings) || {};
@@ -365,23 +397,48 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   }
   queueSave(force = false) {
     if (!force && !this.data.settings.persistOrderOnCreateDelete) return;
+    this.saveDirty = true;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
-      this.savePromise = this.savePromise.then(() => this.saveData(this.data));
+      void this.enqueueDirtySave();
     }, 250);
+  }
+  enqueueDirtySave() {
+    this.savePromise = this.savePromise.catch((error) => {
+      console.error("[Yuque Order Drag] Previous data save failed; retrying.", error);
+    }).then(async () => {
+      while (this.saveDirty) {
+        this.saveDirty = false;
+        try {
+          await this.saveData(this.data);
+        } catch (error) {
+          this.saveDirty = true;
+          console.error("[Yuque Order Drag] Failed to save plugin data.", error);
+          break;
+        }
+      }
+    });
+    return this.savePromise;
   }
   async flushSave() {
     if (this.saveTimer !== null) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
-      this.savePromise = this.savePromise.then(() => this.saveData(this.data));
     }
+    if (this.saveDirty) await this.enqueueDirtySave();
     await this.savePromise;
   }
+  async forceSave() {
+    if (this.saveTimer !== null) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.saveDirty = true;
+    await this.enqueueDirtySave();
+  }
   async saveSettings() {
-    await this.flushSave();
-    await this.saveData(this.data);
+    await this.forceSave();
   }
   async reconcileVault(forceRefresh) {
     const all = this.app.vault.getAllLoadedFiles();
@@ -391,8 +448,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     for (const file of files) await this.ensureFileGuid(file);
     for (const folder of folders) await this.ensureFolderGuid(folder);
     for (const folder of folders) this.reconcileFolder(folder);
-    await this.flushSave();
-    await this.saveData(this.data);
+    await this.forceSave();
     if (forceRefresh) this.refreshExplorer();
   }
   reconcileFolder(folder) {
@@ -846,8 +902,7 @@ ${text}`;
       });
     }
     if (seeded) {
-      await this.flushSave();
-      await this.saveData(this.data);
+      await this.forceSave();
       this.refreshExplorer();
       new import_obsidian.Notice("\u5DF2\u4ECE\u8BED\u96C0\u6E05\u5355\u5BFC\u5165\u987A\u5E8F");
     } else {
@@ -915,6 +970,7 @@ ${text}`;
       this.restoreExplorerPatch = () => {
         prototype.getSortedFolderItems = original;
       };
+      this.explorerPatchActive = true;
     } catch (error) {
       if (!this.manifestNoticeShown) {
         this.manifestNoticeShown = true;
@@ -923,26 +979,33 @@ ${text}`;
     }
   }
   setupExplorer() {
-    var _a;
-    if (this.explorerSetup) return;
+    var _a, _b;
     const view = (_a = this.app.workspace.getLeavesOfType("file-explorer")[0]) == null ? void 0 : _a.view;
     const container = (view == null ? void 0 : view.containerEl) || document.querySelector(".nav-files-container");
     if (!view || !container) {
-      const observer = new MutationObserver(() => {
-        var _a2;
+      if (this.explorerWaitObserver) return;
+      this.explorerWaitObserver = new MutationObserver(() => {
+        var _a2, _b2;
         if (!((_a2 = this.app.workspace.getLeavesOfType("file-explorer")[0]) == null ? void 0 : _a2.view)) return;
-        observer.disconnect();
+        (_b2 = this.explorerWaitObserver) == null ? void 0 : _b2.disconnect();
+        this.explorerWaitObserver = null;
         this.setupExplorer();
       });
-      observer.observe(document.body, { childList: true, subtree: true });
-      this.register(() => observer.disconnect());
+      this.explorerWaitObserver.observe(document.body, { childList: true, subtree: true });
       return;
     }
-    if (!this.explorerView) this.explorerView = view;
-    this.explorerSetup = true;
+    (_b = this.explorerWaitObserver) == null ? void 0 : _b.disconnect();
+    this.explorerWaitObserver = null;
+    const explorerChanged = this.explorerView !== view || this.explorerContainer !== container;
+    this.explorerView = view;
     this.patchFileExplorer();
-    this.installDragHandlers();
-    this.refreshExplorer();
+    if (!this.explorerSetup) {
+      this.explorerSetup = true;
+      this.installDragHandlers();
+    } else {
+      this.observeExplorerContainer(container);
+    }
+    if (explorerChanged) this.refreshExplorer();
   }
   getExplorerContainer() {
     var _a;
@@ -987,49 +1050,53 @@ ${text}`;
   }
   showDropFeedback(targetEl, position, clientX, clientY) {
     var _a;
-    this.clearDropTargets();
-    targetEl.classList.add(`yq-order-drop-${position}`);
+    const targetChanged = this.dropTargetEl !== targetEl || this.dropTargetPosition !== position;
+    if (targetChanged) {
+      this.clearDropTargets();
+      this.dropTargetEl = targetEl;
+      this.dropTargetPosition = position;
+      targetEl.classList.add(`yq-order-drop-${position}`);
+    }
     if (!this.dragHintEl) {
       this.dragHintEl = document.createElement("div");
       this.dragHintEl.className = "yq-order-drag-hint";
       document.body.appendChild(this.dragHintEl);
     }
-    const targetName = ((_a = this.dropSurface(targetEl).textContent) == null ? void 0 : _a.trim()) || this.pathFromElement(targetEl);
-    const action = position === "before" ? "\u63D2\u5165\u5230\u4E0A\u65B9" : position === "after" ? "\u63D2\u5165\u5230\u4E0B\u65B9" : "\u79FB\u5165";
-    this.dragHintEl.textContent = `${action}\uFF1A${targetName}`;
-    const hintRect = this.dragHintEl.getBoundingClientRect();
-    const left = Math.max(8, Math.min(clientX + 14, window.innerWidth - hintRect.width - 8));
+    if (targetChanged || !this.dragHintEl.textContent) {
+      const targetName = ((_a = this.dropSurface(targetEl).textContent) == null ? void 0 : _a.trim()) || this.pathFromElement(targetEl);
+      const action = position === "before" ? "\u63D2\u5165\u5230\u4E0A\u65B9" : position === "after" ? "\u63D2\u5165\u5230\u4E0B\u65B9" : "\u79FB\u5165";
+      this.dragHintEl.textContent = `${action}\uFF1A${targetName}`;
+      const hintRect = this.dragHintEl.getBoundingClientRect();
+      this.dragHintWidth = hintRect.width;
+      this.dragHintHeight = hintRect.height;
+    }
+    const left = Math.max(8, Math.min(clientX + 14, window.innerWidth - this.dragHintWidth - 8));
     const below = clientY + 18;
-    const top = below + hintRect.height <= window.innerHeight - 8 ? below : Math.max(8, clientY - hintRect.height - 14);
+    const top = below + this.dragHintHeight <= window.innerHeight - 8 ? below : Math.max(8, clientY - this.dragHintHeight - 14);
     this.dragHintEl.style.left = `${left}px`;
     this.dragHintEl.style.top = `${top}px`;
   }
   clearDropTargets() {
-    document.querySelectorAll(".yq-order-drop-before, .yq-order-drop-inside, .yq-order-drop-after").forEach((element) => element.classList.remove(
+    var _a;
+    (_a = this.dropTargetEl) == null ? void 0 : _a.classList.remove(
       "yq-order-drop-before",
       "yq-order-drop-inside",
       "yq-order-drop-after"
-    ));
+    );
+    this.dropTargetEl = null;
+    this.dropTargetPosition = null;
   }
   clearDropFeedback() {
     var _a;
     this.clearDropTargets();
     (_a = this.dragHintEl) == null ? void 0 : _a.remove();
     this.dragHintEl = null;
+    this.dragHintWidth = 0;
+    this.dragHintHeight = 0;
   }
   installDragHandlers() {
     const explorerContainer = this.getExplorerContainer() || void 0;
-    if (explorerContainer) {
-      const markDraggable = () => explorerContainer.querySelectorAll(".nav-file, .nav-folder").forEach((element) => element.setAttribute("draggable", "true"));
-      markDraggable();
-      const observer = new MutationObserver(() => {
-        markDraggable();
-        this.scheduleDomOrder();
-      });
-      observer.observe(explorerContainer, { childList: true, subtree: true });
-      this.register(() => observer.disconnect());
-      this.scheduleDomOrder();
-    }
+    if (explorerContainer) this.observeExplorerContainer(explorerContainer);
     this.registerDomEvent(document, "dragstart", (event) => {
       if (!this.data.settings.enableDrag) return;
       const item = this.explorerItem(event.target);
@@ -1070,18 +1137,31 @@ ${text}`;
     }, true);
     this.registerDomEvent(document, "dragend", () => this.clearDragState(), true);
   }
-  clearDragState() {
-    this.dragSourcePath = "";
-    document.querySelectorAll(
-      ".yq-order-drag-source, .yq-order-drop-before, .yq-order-drop-inside, .yq-order-drop-after"
-    ).forEach((el) => {
-      el.classList.remove(
-        "yq-order-drag-source",
-        "yq-order-drop-before",
-        "yq-order-drop-inside",
-        "yq-order-drop-after"
-      );
+  observeExplorerContainer(container) {
+    var _a;
+    if (this.explorerContainer === container && this.explorerObserver) return;
+    (_a = this.explorerObserver) == null ? void 0 : _a.disconnect();
+    this.explorerContainer = container;
+    const markDraggable = (root) => {
+      if (root instanceof HTMLElement && root.matches(".nav-file, .nav-folder")) {
+        root.setAttribute("draggable", "true");
+      }
+      root.querySelectorAll(".nav-file, .nav-folder").forEach((element) => element.setAttribute("draggable", "true"));
+    };
+    markDraggable(container);
+    this.explorerObserver = new MutationObserver((records) => {
+      records.forEach((record) => record.addedNodes.forEach((node) => {
+        if (node instanceof HTMLElement) markDraggable(node);
+      }));
+      this.scheduleDomOrder();
     });
+    this.explorerObserver.observe(container, { childList: true, subtree: true });
+    this.scheduleDomOrder();
+  }
+  clearDragState() {
+    var _a;
+    this.dragSourcePath = "";
+    (_a = this.getExplorerContainer()) == null ? void 0 : _a.querySelectorAll(".yq-order-drag-source").forEach((el) => el.classList.remove("yq-order-drag-source"));
     this.clearDropFeedback();
   }
   async handleDrop(sourcePath, targetPath, position) {
@@ -1105,20 +1185,39 @@ ${text}`;
         return;
       }
     }
-    if (targetFolder && targetFolder !== source && !targetFolder.path.startsWith(`${source.path}/`)) {
+    if (targetFolder) {
       const destination = `${targetFolder.path}/${basename(source.path)}`;
-      if (this.app.vault.getAbstractFileByPath(destination)) {
+      const sourceGuid2 = this.getItemGuidSync(source);
+      const blocked = moveBlockReason(
+        source.path,
+        source instanceof import_obsidian.TFolder,
+        targetFolder.path,
+        Boolean(this.app.vault.getAbstractFileByPath(destination))
+      );
+      if (blocked === "self-or-descendant") {
+        new import_obsidian.Notice("\u4E0D\u80FD\u628A\u6587\u4EF6\u5939\u79FB\u52A8\u5230\u5B83\u81EA\u5DF1\u7684\u5B50\u76EE\u5F55\u4E2D");
+        return;
+      }
+      if (blocked === "conflict") {
         new import_obsidian.Notice("\u76EE\u6807\u6587\u4EF6\u5939\u4E2D\u5DF2\u5B58\u5728\u540C\u540D\u6587\u4EF6");
         return;
       }
-      const guid = this.getItemGuidSync(source);
-      if (guid) removeGuidFromOrders(this.data.orderByFolder, guid);
       try {
         await this.app.fileManager.renameFile(source, destination);
       } catch (error) {
         new import_obsidian.Notice(`\u79FB\u52A8\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      if (sourceGuid2) {
+        relocateGuid(
+          this.data.orderByFolder,
+          this.folderKeySync(targetFolder),
+          sourceGuid2,
+          this.data.settings.newItemPlacement
+        );
       }
       this.queueSave(true);
+      await this.flushSave();
       this.refreshExplorer();
       return;
     }
@@ -1126,12 +1225,18 @@ ${text}`;
     const targetGuid = this.getItemGuidSync(target);
     if (!sourceGuid || !targetGuid || !source.parent || !target.parent) return;
     if (source.parent.path !== target.parent.path) {
-      if (target.parent === source || target.parent.path.startsWith(`${source.path}/`)) {
+      const destination = target.parent.path ? `${target.parent.path}/${basename(source.path)}` : basename(source.path);
+      const blocked = moveBlockReason(
+        source.path,
+        source instanceof import_obsidian.TFolder,
+        target.parent.path,
+        Boolean(this.app.vault.getAbstractFileByPath(destination))
+      );
+      if (blocked === "self-or-descendant") {
         new import_obsidian.Notice("\u4E0D\u80FD\u628A\u6587\u4EF6\u5939\u79FB\u52A8\u5230\u5B83\u81EA\u5DF1\u7684\u5B50\u76EE\u5F55\u4E2D");
         return;
       }
-      const destination = target.parent.path ? `${target.parent.path}/${basename(source.path)}` : basename(source.path);
-      if (this.app.vault.getAbstractFileByPath(destination)) {
+      if (blocked === "conflict") {
         new import_obsidian.Notice("\u76EE\u6807\u76EE\u5F55\u4E2D\u5DF2\u5B58\u5728\u540C\u540D\u6587\u4EF6");
         return;
       }
@@ -1145,7 +1250,13 @@ ${text}`;
       } catch (error) {
         this.pendingDropPlacements.delete(sourceGuid);
         new import_obsidian.Notice(`\u79FB\u52A8\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+        return;
       }
+      this.placeGuidRelative(target.parent, sourceGuid, targetGuid, position === "before");
+      this.queueSave(true);
+      await this.flushSave();
+      window.setTimeout(() => this.pendingDropPlacements.delete(sourceGuid), 1e3);
+      this.refreshExplorer();
       return;
     }
     const key = this.folderKeySync(source.parent);
@@ -1157,6 +1268,13 @@ ${text}`;
     this.refreshExplorer();
   }
   refreshExplorer() {
+    if (this.explorerRefreshFrame !== null) return;
+    this.explorerRefreshFrame = window.requestAnimationFrame(() => {
+      this.explorerRefreshFrame = null;
+      this.performExplorerRefresh();
+    });
+  }
+  performExplorerRefresh() {
     var _a;
     try {
       const view = this.explorerView;
@@ -1176,6 +1294,7 @@ ${text}`;
    * while all authoritative order data remains in data.json.
    */
   scheduleDomOrder() {
+    if (this.explorerPatchActive) return;
     if (this.domOrderFrame !== null) return;
     this.domOrderFrame = window.requestAnimationFrame(() => {
       this.domOrderFrame = null;

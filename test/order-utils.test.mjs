@@ -18,7 +18,7 @@ import {
   sortEntries,
   uniqueKnownOrder,
 } from "../src/order-utils.ts";
-import { dropPositionForPointer } from "../src/drag-utils.ts";
+import { dropPositionForPointer, moveBlockReason } from "../src/drag-utils.ts";
 
 test("drag targeting exposes precise before, inside, and after zones", () => {
   assert.equal(dropPositionForPointer(100, 100, 20, true), "before");
@@ -26,6 +26,13 @@ test("drag targeting exposes precise before, inside, and after zones", () => {
   assert.equal(dropPositionForPointer(120, 100, 20, true), "after");
   assert.equal(dropPositionForPointer(109, 100, 20, false), "before");
   assert.equal(dropPositionForPointer(111, 100, 20, false), "after");
+});
+
+test("drag move validation rejects self, descendants, and name conflicts", () => {
+  assert.equal(moveBlockReason("A", true, "A", false), "self-or-descendant");
+  assert.equal(moveBlockReason("A", true, "A/child", false), "self-or-descendant");
+  assert.equal(moveBlockReason("A/file.md", false, "B", true), "conflict");
+  assert.equal(moveBlockReason("A/file.md", false, "B", false), null);
 });
 
 test("sortEntries keeps saved guid order and puts unknown items last", () => {
@@ -36,6 +43,15 @@ test("sortEntries keeps saved guid order and puts unknown items last", () => {
   ];
   const sorted = sortEntries(items, ["c", "a"], (item) => item.guid);
   assert.deepEqual(sorted.map((item) => item.guid), ["c", "a", "b"]);
+});
+
+test("sortEntries cache is invalidated by replacing the immutable order array", () => {
+  const items = [
+    { path: "a.md", name: "A", guid: "a" },
+    { path: "b.md", name: "B", guid: "b" },
+  ];
+  assert.deepEqual(sortEntries(items, ["a", "b"], (item) => item.guid).map((item) => item.guid), ["a", "b"]);
+  assert.deepEqual(sortEntries(items, ["b", "a"], (item) => item.guid).map((item) => item.guid), ["b", "a"]);
 });
 
 test("moveGuid moves an item before or after a target", () => {
@@ -137,6 +153,27 @@ test("an explicit cross-folder drop keeps siblings stable and honors its exact t
   relocateGuid(orders, "target", "moving", "bottom");
   orders.target = moveGuid(orders.target, "moving", "c", true);
   assert.deepEqual(orders, { source: ["a", "b"], target: ["moving", "c", "d"] });
+
+  const afterOrders = { source: ["a", "moving", "b"], target: ["c", "d"] };
+  relocateGuid(afterOrders, "target", "moving", "bottom");
+  afterOrders.target = moveGuid(afterOrders.target, "moving", "c", false);
+  assert.deepEqual(afterOrders, { source: ["a", "b"], target: ["c", "moving", "d"] });
+});
+
+test("invalid, conflicting, cancelled, or failed drops do not modify order", () => {
+  const blockedMoves = [
+    moveBlockReason("folder", true, "folder/child", false),
+    moveBlockReason("source.md", false, "target", true),
+    "cancelled",
+    "failed",
+  ];
+  for (const outcome of blockedMoves) {
+    const orders = { source: ["a", "moving", "b"], target: ["c", "d"] };
+    const before = structuredClone(orders);
+    // Production commits relocateGuid only after renameFile succeeds.
+    if (outcome === null) relocateGuid(orders, "target", "moving", "bottom");
+    assert.deepEqual(orders, before, outcome);
+  }
 });
 
 test("folder-note identity changes keep the folder in the same position", () => {
@@ -197,4 +234,31 @@ test("Yuque manifest import has exactly one explicit manual call site", async ()
   assert.match(source, /async requestManifestImport\(\)/);
   assert.doesNotMatch(source, /vault\.on\("modify"/);
   assert.doesNotMatch(source, /autoSeedFromManifest/);
+});
+
+test("drop execution defers authoritative order mutation until rename succeeds", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  const branchStart = source.indexOf("if (targetFolder) {");
+  const rename = source.indexOf("await this.app.fileManager.renameFile(source as any, destination)", branchStart);
+  assert.notEqual(branchStart, -1);
+  assert.notEqual(rename, -1);
+  assert.doesNotMatch(source.slice(branchStart, rename), /removeGuidFromOrders|relocateGuid|placeGuidRelative/);
+});
+
+test("drag cancellation clears only transient UI state", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  const clearStart = source.indexOf("private clearDragState(): void");
+  const dropStart = source.indexOf("private async handleDrop", clearStart);
+  assert.notEqual(clearStart, -1);
+  assert.notEqual(dropStart, -1);
+  assert.doesNotMatch(
+    source.slice(clearStart, dropStart),
+    /orderByFolder|removeGuidFromOrders|relocateGuid|moveGuid|saveData/,
+  );
+});
+
+test("explorer refresh requests are coalesced by an animation-frame guard", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  assert.match(source, /refreshExplorer\(\): void \{\s+if \(this\.explorerRefreshFrame !== null\) return;/);
+  assert.match(source, /this\.explorerRefreshFrame = window\.requestAnimationFrame/);
 });

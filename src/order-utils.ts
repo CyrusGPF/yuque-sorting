@@ -5,6 +5,16 @@ export type SortableEntry = {
   name: string;
 };
 
+const entryNameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
+// Order arrays are replaced, rather than mutated, whenever plugin state
+// changes. A WeakMap therefore avoids rebuilding the same rank table during
+// repeated explorer renders without retaining obsolete orders.
+const rankByOrder = new WeakMap<string[], Map<string, number>>();
+
 /**
  * 与导出端 utils.sanitizePathComponent 等价的清洗实现（用于按目录名兜底匹配，
  * 保持对语雀标题清洗后目录名的一致理解：NFKC、非法字符→下划线、空白折叠等）。
@@ -37,7 +47,7 @@ export function normalizeGuid(value: unknown): string | null {
 }
 
 export function compareEntryNames(a: SortableEntry, b: SortableEntry): number {
-  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  return entryNameCollator.compare(a.name, b.name);
 }
 
 export function sortEntries<T extends SortableEntry>(
@@ -46,10 +56,14 @@ export function sortEntries<T extends SortableEntry>(
   guidOf: (entry: T) => string | null,
   fallback: "name" | "name-last" = "name-last",
 ): T[] {
-  const rank = new Map<string, number>();
-  savedOrder.forEach((guid, index) => {
-    if (!rank.has(guid)) rank.set(guid, index);
-  });
+  let rank = rankByOrder.get(savedOrder);
+  if (!rank) {
+    rank = new Map<string, number>();
+    savedOrder.forEach((guid, index) => {
+      if (!rank!.has(guid)) rank!.set(guid, index);
+    });
+    rankByOrder.set(savedOrder, rank);
+  }
 
   return entries
     .map((entry, originalIndex) => ({ entry, originalIndex, guid: guidOf(entry) }))
