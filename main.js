@@ -394,7 +394,7 @@ function parseVaultTransfer(value) {
   if (!v || v.format !== "yuque-vault-transfer" || v.version !== 1 || !Array.isArray(v.items) || !v.orders || typeof v.orders !== "object" || Array.isArray(v.orders)) throw new Error("\u4E0D\u662F\u6709\u6548\u7684\u8DE8 Vault \u987A\u5E8F\u5305 v1");
   const paths = /* @__PURE__ */ new Map();
   for (const item of v.items) {
-    if (!item || !safeTransferPath(item.path) || !["file", "folder"].includes(item.kind) || typeof item.guid !== "string" || !/^[A-Za-z0-9:_-]+$/.test(item.guid) || item.guid.length > 256 || ["__proto__", "constructor", "prototype"].includes(item.guid)) throw new Error("\u987A\u5E8F\u5305\u5305\u542B\u65E0\u6548\u8DEF\u5F84\u6216\u8EAB\u4EFD");
+    if (!item || !safeTransferPath(item.path) || !["file", "folder"].includes(item.kind) || typeof item.guid !== "string" || !/^[A-Za-z0-9:_-]+$/.test(item.guid) || item.guid.length > 256 || ["__proto__", "constructor", "prototype"].includes(item.guid)) throw new Error("\u987A\u5E8F\u5305\u5305\u542B\u65E0\u6548\u8DEF\u5F84\u6216 GUID");
     if (paths.has(item.path)) throw new Error(`\u6765\u6E90\u5B58\u5728\u91CD\u590D\u8DEF\u5F84\uFF1A${item.path}`);
     paths.set(item.path, item);
   }
@@ -822,6 +822,76 @@ async function sourceTransfer(io, root, entries, pluginId, generate, parseYaml2)
   return { pack: parseVaultTransfer(pack), fallback, generated, metadataPath, metadataText };
 }
 
+// src/manifest-restore-view.ts
+var MANIFEST_PREVIEW_LIMIT = 10;
+var MANIFEST_PROBLEM_LIMIT = 12;
+function splitManifestProblem(problem) {
+  const separator = problem.indexOf("\uFF1A");
+  if (separator === -1) return { path: "", reason: problem };
+  return { path: problem.slice(0, separator), reason: problem.slice(separator + 1) };
+}
+function renderManifestRestoreView(container, view) {
+  const wrap = container.createDiv({ cls: "yq-manifest-restore" });
+  const statsEl = wrap.createDiv({ cls: "yq-manifest-stats" });
+  const stats = [
+    { label: "\u6709\u6548\u6E05\u5355", value: `${view.manifestCount} \u4EFD` },
+    { label: "\u987A\u5E8F\u5C06\u53D8\u5316", value: `${view.changedDirectories} \u4E2A\u76EE\u5F55`, tone: view.changedDirectories ? "warn" : "ok" },
+    { label: "\u663E\u793A\u4F4D\u7F6E\u4E0D\u540C", value: `${view.changedPositions} \u5904`, tone: view.changedPositions ? "warn" : "ok" },
+    { label: "\u6E05\u5355\u5DEE\u5F02", value: `${view.problems.length} \u9879`, tone: view.problems.length ? "warn" : "ok" }
+  ];
+  stats.forEach(({ label, value, tone }) => {
+    const cell = statsEl.createDiv({ cls: `yq-manifest-stat${tone ? ` is-${tone}` : ""}` });
+    cell.createSpan({ cls: "yq-manifest-stat-label", text: label });
+    cell.createSpan({ cls: "yq-manifest-stat-value", text: value });
+  });
+  wrap.createEl("p", {
+    cls: "yq-manifest-status",
+    text: view.changedDirectories ? "\u4E0B\u5217\u793A\u4F8B\u76EE\u5F55\u7684\u663E\u793A\u987A\u5E8F\u5C06\u4E0E\u6E05\u5355\u4E0D\u540C\uFF1B\u786E\u8BA4\u540E\u6309\u6E05\u5355\u987A\u5E8F\u6392\u5217\uFF0C\u672A\u5217\u51FA\u7684\u53D8\u5316\u76EE\u5F55\u540C\u6837\u5904\u7406\u3002" : "\u5F53\u524D\u53EF\u5339\u914D\u9879\u76EE\u7684\u663E\u793A\u987A\u5E8F\u4E0E\u6E05\u5355\u4E00\u81F4\uFF0C\u786E\u8BA4\u540E\u4E0D\u4F1A\u6539\u53D8\u4EFB\u4F55\u76EE\u5F55\u7684\u73B0\u6709\u987A\u5E8F\u3002"
+  });
+  const previews = view.previews.slice(0, MANIFEST_PREVIEW_LIMIT);
+  if (previews.length) {
+    const section = wrap.createDiv({ cls: "yq-manifest-section" });
+    section.createEl("h4", { text: `\u987A\u5E8F\u53D8\u5316\u793A\u4F8B\uFF08${previews.length} / ${view.changedDirectories}\uFF09` });
+    const list = section.createEl("ul", { cls: "yq-manifest-preview" });
+    previews.forEach(({ folder, current, next }) => {
+      const item = list.createEl("li");
+      item.createDiv({ cls: "yq-manifest-folder", text: folder });
+      const currentRow = item.createDiv({ cls: "yq-manifest-order" });
+      currentRow.createSpan({ cls: "yq-manifest-tag", text: "\u5F53\u524D" });
+      currentRow.createSpan({ text: current });
+      const nextRow = item.createDiv({ cls: "yq-manifest-order is-next" });
+      nextRow.createSpan({ cls: "yq-manifest-tag", text: "\u6062\u590D\u540E" });
+      nextRow.createSpan({ text: next });
+    });
+  }
+  if (view.problems.length) {
+    const section = wrap.createDiv({ cls: "yq-manifest-section is-problems" });
+    section.createEl("h4", { text: `\u6E05\u5355\u5DEE\u5F02\uFF08${view.problems.length}\uFF09` });
+    const list = section.createEl("ul", { cls: "yq-manifest-problems" });
+    view.problems.slice(0, MANIFEST_PROBLEM_LIMIT).forEach((problem) => {
+      const { path, reason } = splitManifestProblem(problem);
+      const item = list.createEl("li");
+      if (path) item.createDiv({ cls: "yq-manifest-path", text: path });
+      item.createDiv({ cls: "yq-manifest-reason", text: reason });
+    });
+    if (view.problems.length > MANIFEST_PROBLEM_LIMIT) {
+      list.createEl("li", { cls: "yq-manifest-more", text: `\u53E6\u6709 ${view.problems.length - MANIFEST_PROBLEM_LIMIT} \u9879\u2026\u2026` });
+    }
+    section.createEl("p", { cls: "yq-manifest-hint", text: "\u7EE7\u7EED\u4EC5\u5904\u7406\u80FD\u591F\u5339\u914D\u7684\u9879\u76EE\uFF0C\u4EE5\u4E0A\u5DEE\u5F02\u4E0D\u4F1A\u81EA\u52A8\u4FEE\u590D\u3002" });
+  }
+  const notes = [
+    view.newManifests ? `${view.newManifests} \u4EFD\u6E05\u5355\u4E3A\u9996\u6B21\u4F7F\u7528\uFF0C\u5C06\u91C7\u7528\u6E05\u5355\u91CC\u7684 GUID \u5E76\u5EFA\u7ACB\u7D22\u5F15\uFF1BMarkdown \u6B63\u6587\u4E0D\u6539\u5199\u3002` : "\u4EC5\u6062\u590D\u987A\u5E8F\uFF0C\u4E0D\u8986\u76D6\u540E\u6765\u66F4\u6362\u7684 GUID\u3002",
+    "\u5339\u914D\u53EA\u770B\u6E05\u5355\u4E2D\u7684\u8DEF\u5F84\uFF0C\u4E0D\u770B\u6587\u4EF6\u5185\u5BB9\uFF1A\u5DF2\u6539\u540D\u6216\u79FB\u52A8\u8FC7\u7684\u9879\u76EE\u65E0\u6CD5\u6062\u590D\u539F\u987A\u5E8F\uFF0C\u4F1A\u63D0\u793A\u7F3A\u5931/\u591A\u51FA\u3002"
+  ];
+  if (view.newManifests < view.manifestCount) {
+    notes.push("\u540C\u4E00\u8DEF\u5F84\u82E5\u5DF2\u6362\u6210\u53E6\u4E00\u4E2A\u6587\u4EF6\uFF0C\u63D2\u4EF6\u4E0D\u4F1A\u8BC6\u522B\uFF0C\u4F1A\u76F4\u63A5\u6309\u6E05\u5355\u4F4D\u7F6E\u7ED9\u5B83\u6392\u5E8F\u3002");
+  }
+  notes.push("\u4E0D\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u5B9E\u9645\u6587\u4EF6\u3002");
+  notes.push("\u786E\u8BA4\u540E\u4F1A\u6E05\u7A7A\u62D6\u62FD\u64A4\u9500\u5386\u53F2\uFF1B\u53D6\u6D88\u6216\u5173\u95ED\u7A97\u53E3\u4E0D\u4FEE\u6539\u6570\u636E\u3002");
+  const noteList = wrap.createEl("ul", { cls: "yq-manifest-notes" });
+  notes.forEach((note) => noteList.createEl("li", { text: note }));
+}
+
 // main.ts
 var MANIFEST_NAME = "_yuque_order.json";
 var GUID_FRONTMATTER_KEY = "guid";
@@ -855,17 +925,19 @@ function yieldToUi() {
   return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 var ConfirmActionModal = class extends import_obsidian.Modal {
-  constructor(app, titleText, message, confirmText, resolveChoice) {
+  constructor(app, titleText, message, confirmText, resolveChoice, renderDetails) {
     super(app);
     this.titleText = titleText;
     this.message = message;
     this.confirmText = confirmText;
     this.resolveChoice = resolveChoice;
+    this.renderDetails = renderDetails;
     this.settled = false;
   }
   onOpen() {
     this.setTitle(this.titleText);
-    this.contentEl.createEl("p", { text: this.message });
+    if (this.renderDetails) this.renderDetails(this.contentEl);
+    else this.contentEl.createEl("p", { text: this.message });
     new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.finish(false))).addButton((button) => button.setButtonText(this.confirmText).setWarning().onClick(() => this.finish(true)));
   }
   onClose() {
@@ -877,6 +949,21 @@ var ConfirmActionModal = class extends import_obsidian.Modal {
     this.settled = true;
     this.resolveChoice(choice);
     this.close();
+  }
+};
+var SettingDetailsModal = class extends import_obsidian.Modal {
+  constructor(app, titleText, paragraphs) {
+    super(app);
+    this.titleText = titleText;
+    this.paragraphs = paragraphs;
+  }
+  onOpen() {
+    this.setTitle(this.titleText);
+    const body = this.contentEl.createDiv({ cls: "yq-setting-details" });
+    this.paragraphs.forEach((paragraph) => body.createEl("p", { text: paragraph }));
+  }
+  onClose() {
+    this.contentEl.empty();
   }
 };
 var CopyConflictModal = class extends import_obsidian.Modal {
@@ -1634,7 +1721,7 @@ ${file.path}`;
     const proceed = await new Promise((resolve) => new ConfirmActionModal(
       this.app,
       "\u68C0\u6D4B\u5230\u672A\u7BA1\u7406\u9879\u76EE",
-      `\u53D1\u73B0 ${fileCount} \u4E2A\u6587\u4EF6\u548C ${unmanaged.length - fileCount} \u4E2A\u6587\u4EF6\u5939\u3002\u5C06\u53EA\u4E3A\u7F3A\u5931\u8EAB\u4EFD\u7684\u9879\u76EE\u751F\u6210 GUID\uFF0C\u5E76\u6309\u65B0\u589E\u9879\u89C4\u5219\u7EB3\u5165\u7BA1\u7406\uFF1B\u5DF2\u6709\u5144\u5F1F\u9879\u76F8\u5BF9\u987A\u5E8F\u4E0D\u53D8\u3002`,
+      `\u53D1\u73B0 ${fileCount} \u4E2A\u6587\u4EF6\u548C ${unmanaged.length - fileCount} \u4E2A\u6587\u4EF6\u5939\u3002\u5C06\u53EA\u4E3A\u7F3A\u5C11 GUID \u7684\u9879\u76EE\u751F\u6210 GUID\uFF0C\u5E76\u6309\u65B0\u589E\u9879\u89C4\u5219\u7EB3\u5165\u7BA1\u7406\uFF1B\u5DF2\u6709\u5144\u5F1F\u9879\u76F8\u5BF9\u987A\u5E8F\u4E0D\u53D8\u3002`,
       "\u751F\u6210 GUID \u5E76\u7EB3\u5165\u7BA1\u7406",
       resolve
     ).open());
@@ -1645,14 +1732,14 @@ ${file.path}`;
     const unmanaged = await this.collectUnmanagedItems();
     const unindexed = this.collectUnindexedItems();
     if (!unmanaged.length && !unindexed.length) {
-      new import_obsidian.Notice("\u5F53\u524D Vault \u7684\u8EAB\u4EFD\u548C\u76EE\u5F55\u7D22\u5F15\u5747\u5B8C\u6574\uFF1B\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u5DF2\u88AB\u5B9E\u65F6\u81EA\u52A8\u63A5\u7BA1");
+      new import_obsidian.Notice("\u5F53\u524D Vault \u7684 GUID \u548C\u76EE\u5F55\u7D22\u5F15\u5747\u5B8C\u6574\uFF1B\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u5DF2\u88AB\u5B9E\u65F6\u81EA\u52A8\u63A5\u7BA1");
       return;
     }
     const currentOrder = this.collectIdentityState().folderChildrenByPath;
     const proceed = await new Promise((resolve) => new ConfirmActionModal(
       this.app,
       "\u63A5\u7BA1\u5386\u53F2 Obsidian Vault",
-      `\u53D1\u73B0 ${unmanaged.length} \u4E2A\u9879\u76EE\u7F3A\u5C11 GUID\u3001${unindexed.length} \u4E2A\u9879\u76EE\u7F3A\u5C11\u76EE\u5F55\u7D22\u5F15\u3002${unindexed.length ? `\u7F3A\u5C11\u7D22\u5F15\uFF1A${unindexed.slice(0, 10).map((item) => item.path).join("\uFF1B")}${unindexed.length > 10 ? `\uFF1B\u53E6\u6709 ${unindexed.length - 10} \u9879` : ""}\u3002` : ""}\u5C06\u8865\u5168\u8EAB\u4EFD\uFF0C\u5E76\u4EE5\u5F53\u524D\u663E\u793A\u7ED3\u6784\u4E00\u6B21\u6027\u91CD\u5EFA\u76EE\u5F55\u7D22\u5F15\uFF1B\u4E0D\u4F1A\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u6587\u4EF6\u3002`,
+      `\u53D1\u73B0 ${unmanaged.length} \u4E2A\u9879\u76EE\u7F3A\u5C11 GUID\u3001${unindexed.length} \u4E2A\u9879\u76EE\u7F3A\u5C11\u76EE\u5F55\u7D22\u5F15\u3002${unindexed.length ? `\u7F3A\u5C11\u7D22\u5F15\uFF1A${unindexed.slice(0, 10).map((item) => item.path).join("\uFF1B")}${unindexed.length > 10 ? `\uFF1B\u53E6\u6709 ${unindexed.length - 10} \u9879` : ""}\u3002` : ""}\u5C06\u8865\u5168\u7F3A\u5931\u7684 GUID\uFF0C\u5E76\u4EE5\u5F53\u524D\u663E\u793A\u7ED3\u6784\u4E00\u6B21\u6027\u91CD\u5EFA\u76EE\u5F55\u7D22\u5F15\uFF1B\u4E0D\u4F1A\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u6587\u4EF6\u3002`,
       "\u5F00\u59CB\u63A5\u7BA1",
       resolve
     ).open());
@@ -1799,13 +1886,13 @@ ${file.path}`;
       const confirm = await new Promise((resolve) => new ConfirmActionModal(
         this.app,
         targetPlan.missing.length ? `\u786E\u8BA4\u81EA\u52A8\u590D\u5236\uFF1A\u5C06\u521B\u5EFA ${targetPlan.missing.join("\u3001")}` : "\u786E\u8BA4\u81EA\u52A8\u590D\u5236",
-        `\u6765\u6E90\uFF1A${source}\uFF1B\u76EE\u6807\uFF1A${destination || "Vault \u6839\u76EE\u5F55"}\u3002\u590D\u5236 ${pack.items.length} \u9879\uFF0C${remapped} \u4E2A\u51B2\u7A81\u6216\u91CD\u590D GUID \u6362\u53F7\uFF0C${sourceInfo.generated} \u9879\u8865\u8EAB\u4EFD\uFF0C${sourceInfo.fallback} \u9879\u65E0\u6765\u6E90\u7D22\u5F15\u3001\u6309\u540D\u79F0\u515C\u5E95\u3002${replacedRoots.size} \u4E2A\u540C\u540D\u9879\u5C06\u6574\u9879\u66FF\u6362\uFF0C\u76EE\u6807\u539F ${removedCount} \u9879\uFF08\u542B\u76EE\u6807\u72EC\u6709\u5B50\u9879\uFF09\u79FB\u5165\u5907\u4EFD\uFF0C\u4E0D\u9012\u5F52\u6DF7\u5408\u3002\u8BA1\u5212\uFF1A${roots.slice(0, 30).map((root) => `${root.source} \u2192 ${root.target}${root.replaces ? " [\u6574\u9879\u66FF\u6362]" : ""}`).join("\uFF1B")}${roots.length > 30 ? "\uFF1B\u5176\u4F59\u7701\u7565" : ""}\u3002\u66FF\u6362\u9879\u6CBF\u7528\u539F\u4F4D\u7F6E\uFF0C\u65B0\u9879\u6309\u65B0\u589E\u4F4D\u7F6E\u8BBE\u7F6E\u63D2\u5165\uFF0C\u5176\u4ED6\u5144\u5F1F\u9879\u987A\u5E8F\u4E0D\u53D8\u3002\u91CD\u547D\u540D\u53EF\u80FD\u5F71\u54CD\u76F8\u5BF9\u94FE\u63A5\uFF0C\u4E0D\u81EA\u52A8\u6539\u5199\u6B63\u6587\u94FE\u63A5\u3002\u8BF7\u5148\u5173\u95ED\u88AB\u66FF\u6362\u7684\u7B14\u8BB0\uFF0C\u5E76\u6682\u505C\u540C\u6B65\u6216\u5176\u4ED6\u7F16\u8F91\u3002`,
+        `\u6765\u6E90\uFF1A${source}\uFF1B\u76EE\u6807\uFF1A${destination || "Vault \u6839\u76EE\u5F55"}\u3002\u590D\u5236 ${pack.items.length} \u9879\uFF0C${remapped} \u4E2A\u51B2\u7A81\u6216\u91CD\u590D GUID \u6362\u53F7\uFF0C${sourceInfo.generated} \u9879\u8865 GUID\uFF0C${sourceInfo.fallback} \u9879\u65E0\u6765\u6E90\u7D22\u5F15\u3001\u6309\u540D\u79F0\u515C\u5E95\u3002${replacedRoots.size} \u4E2A\u540C\u540D\u9879\u5C06\u6574\u9879\u66FF\u6362\uFF0C\u76EE\u6807\u539F ${removedCount} \u9879\uFF08\u542B\u76EE\u6807\u72EC\u6709\u5B50\u9879\uFF09\u79FB\u5165\u5907\u4EFD\uFF0C\u4E0D\u9012\u5F52\u6DF7\u5408\u3002\u8BA1\u5212\uFF1A${roots.slice(0, 30).map((root) => `${root.source} \u2192 ${root.target}${root.replaces ? " [\u6574\u9879\u66FF\u6362]" : ""}`).join("\uFF1B")}${roots.length > 30 ? "\uFF1B\u5176\u4F59\u7701\u7565" : ""}\u3002\u66FF\u6362\u9879\u6CBF\u7528\u539F\u4F4D\u7F6E\uFF0C\u65B0\u9879\u6309\u65B0\u589E\u4F4D\u7F6E\u8BBE\u7F6E\u63D2\u5165\uFF0C\u5176\u4ED6\u5144\u5F1F\u9879\u987A\u5E8F\u4E0D\u53D8\u3002\u91CD\u547D\u540D\u53EF\u80FD\u5F71\u54CD\u76F8\u5BF9\u94FE\u63A5\uFF0C\u4E0D\u81EA\u52A8\u6539\u5199\u6B63\u6587\u94FE\u63A5\u3002\u8BF7\u5148\u5173\u95ED\u88AB\u66FF\u6362\u7684\u7B14\u8BB0\uFF0C\u5E76\u6682\u505C\u540C\u6B65\u6216\u5176\u4ED6\u7F16\u8F91\u3002`,
         "\u786E\u8BA4\u590D\u5236\uFF08\u66FF\u6362\u9879\u5DF2\u5907\u4EFD\u540E\u624D\u6267\u884C\uFF09",
         resolve
       ).open());
       if (!confirm) return;
       checkCancelled();
-      if (this.identityMaintenanceInProgress || this.data !== originalData || JSON.stringify(this.data) !== dataSnapshot) throw new Error("\u9884\u68C0\u540E\u8EAB\u4EFD\u6216\u6392\u5E8F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+      if (this.identityMaintenanceInProgress || this.data !== originalData || JSON.stringify(this.data) !== dataSnapshot) throw new Error("\u9884\u68C0\u540E GUID \u6216\u6392\u5E8F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
       this.app.workspace.iterateAllLeaves((leaf) => {
         var _a, _b;
         const path = (_b = (_a = leaf.view) == null ? void 0 : _a.file) == null ? void 0 : _b.path;
@@ -2338,7 +2425,7 @@ ${file.path}`;
         new import_obsidian.Notice("\u65E0\u6CD5\u6062\u590D\uFF1A\u5F53\u524D\u5E93\u5DF2\u6709\u65B0\u589E\u3001\u5220\u9664\u3001\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216 GUID \u53D8\u5316");
         return;
       }
-      const proceed = await new Promise((resolve) => new ConfirmActionModal(this.app, "\u6062\u590D GUID", `\u6062\u590D ${meta.createdAt} \u7684 ${meta.count} \u9879\u8EAB\u4EFD\u548C\u76EE\u5F55\u987A\u5E8F\u3002`, "\u6062\u590D", resolve).open());
+      const proceed = await new Promise((resolve) => new ConfirmActionModal(this.app, "\u6062\u590D GUID", `\u6062\u590D ${meta.createdAt} \u7684 ${meta.count} \u9879 GUID \u548C\u76EE\u5F55\u987A\u5E8F\u3002`, "\u6062\u590D", resolve).open());
       if (!proceed) return;
       this.identityMaintenanceInProgress = true;
       await mapLimit(backup.entries, 4, async (entry) => {
@@ -2385,10 +2472,10 @@ ${file.path}`;
       try {
         const raw = JSON.parse(await this.app.vault.read(file));
         if ((raw == null ? void 0 : raw.version) !== 2 || typeof raw.exportId !== "string" || !Array.isArray(raw.directories)) {
-          problems.push(`${file.path}\uFF1A\u4E0D\u662F v2 \u6E05\u5355`);
+          problems.push(`${file.path}\uFF1A\u65E0\u6CD5\u89E3\u6790`);
         } else parsed.push({ file, raw });
       } catch (e) {
-        problems.push(`${file.path}\uFF1AJSON \u65E0\u6548`);
+        problems.push(`${file.path}\uFF1A\u65E0\u6CD5\u89E3\u6790`);
       }
     }
     if (!parsed.length) {
@@ -2507,6 +2594,7 @@ ${file.path}`;
     const changedDirectories = [];
     let changedPositions = 0;
     const previewLines = [];
+    const previews = [];
     for (const { file, raw } of parsed) {
       const root = ((_b = file.parent) == null ? void 0 : _b.path) || "";
       for (const directory of raw.directories) {
@@ -2521,11 +2609,14 @@ ${file.path}`;
         const next = [...listed, ...current.filter((path) => !listedSet.has(path))];
         const changed = next.reduce((count, path, index) => count + (current[index] !== path ? 1 : 0), 0);
         if (!changed) continue;
-        changedDirectories.push(folderPath || "Vault \u6839\u76EE\u5F55");
+        const folderLabel = folderPath || "Vault \u6839\u76EE\u5F55";
+        changedDirectories.push(folderLabel);
         changedPositions += changed;
         if (previewLines.length < 10) {
           const names = (paths) => paths.slice(0, 6).map((path) => path.split("/").pop()).join(" \u2192 ") + (paths.length > 6 ? " \u2192 \u2026" : "");
-          previewLines.push(`${folderPath || "Vault \u6839\u76EE\u5F55"}\uFF1A\u5F53\u524D [${names(current)}]\uFF1B\u6062\u590D\u540E [${names(next)}]`);
+          const currentText = names(current), nextText = names(next);
+          previews.push({ folder: folderLabel, current: currentText, next: nextText });
+          previewLines.push(`${folderLabel}\uFF1A\u5F53\u524D [${currentText}]\uFF1B\u6062\u590D\u540E [${nextText}]`);
         }
       }
     }
@@ -2533,16 +2624,27 @@ ${file.path}`;
     const fileState = () => JSON.stringify(this.app.vault.getAllLoadedFiles().map((item) => [item.path, item instanceof import_obsidian.TFile ? [item.stat.mtime, item.stat.size] : "folder"]));
     const filesBeforeConfirmation = fileState();
     const newManifests = parsed.filter(({ raw }) => !this.data.consumedManifestIds.includes(raw.exportId)).length;
+    const matchingCaveat = `\u5339\u914D\u53EA\u770B\u6E05\u5355\u4E2D\u7684\u8DEF\u5F84\uFF0C\u4E0D\u770B\u6587\u4EF6\u5185\u5BB9\uFF1A\u5DF2\u6539\u540D\u6216\u79FB\u52A8\u8FC7\u7684\u9879\u76EE\u65E0\u6CD5\u6062\u590D\u539F\u987A\u5E8F\uFF08\u4F1A\u63D0\u793A\u7F3A\u5931/\u591A\u51FA\uFF09\u3002${newManifests < parsed.length ? "\u540C\u4E00\u8DEF\u5F84\u82E5\u5DF2\u6362\u6210\u53E6\u4E00\u4E2A\u6587\u4EF6\uFF0C\u63D2\u4EF6\u4E0D\u4F1A\u8BC6\u522B\uFF0C\u4F1A\u76F4\u63A5\u6309\u6E05\u5355\u4F4D\u7F6E\u6392\u5E8F\u3002" : ""}`;
+    const restoreView = {
+      manifestCount: parsed.length,
+      changedDirectories: changedDirectories.length,
+      changedPositions,
+      previews,
+      problems,
+      newManifests
+    };
+    const renderManifestRestoreDetails = (contentEl) => renderManifestRestoreView(contentEl, restoreView);
     const proceed = await new Promise((resolve) => new ConfirmActionModal(
       this.app,
       "\u786E\u8BA4\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F",
-      `\u5DF2\u68C0\u67E5 ${parsed.length} \u4EFD\u6709\u6548\u6E05\u5355\uFF1B${changedDirectories.length} \u4E2A\u76EE\u5F55\u7684\u987A\u5E8F\u5C06\u53D8\u5316\uFF0C${changedPositions} \u4E2A\u663E\u793A\u4F4D\u7F6E\u4E0D\u540C\u3002${changedDirectories.length ? previewLines.join("\uFF1B") + (changedDirectories.length > 10 ? "\uFF1B\u5176\u4F59\u76EE\u5F55\u7701\u7565" : "") : "\u5F53\u524D\u53EF\u5339\u914D\u9879\u76EE\u7684\u663E\u793A\u987A\u5E8F\u4E0E\u6E05\u5355\u4E00\u81F4\u3002"} ${problems.length ? `\u53E6\u6709 ${problems.length} \u9879\u5185\u5BB9/\u8EAB\u4EFD\u5DEE\u5F02\uFF1A${problems.slice(0, 10).join("\uFF1B")}${problems.length > 10 ? "\uFF1B\u5176\u4F59\u7701\u7565" : ""}\u3002\u7EE7\u7EED\u4EC5\u5904\u7406\u80FD\u591F\u5339\u914D\u7684\u9879\u76EE\u3002` : "\u672A\u53D1\u73B0\u5185\u5BB9\u6216\u8EAB\u4EFD\u5DEE\u5F02\u3002"} ${newManifests ? `${newManifests} \u4EFD\u6E05\u5355\u4E3A\u9996\u6B21\u4F7F\u7528\uFF0C\u5C06\u6309\u73B0\u6709\u89C4\u5219\u91C7\u7528\u5BFC\u51FA\u8EAB\u4EFD\u5E76\u5EFA\u7ACB\u7D22\u5F15\uFF1BMarkdown \u6B63\u6587\u4E0D\u6539\u5199\u3002` : "\u4EC5\u6062\u590D\u987A\u5E8F\uFF0C\u4E0D\u8986\u76D6\u540E\u6765\u66F4\u6362\u7684 GUID\u3002"} \u4E0D\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u5B9E\u9645\u6587\u4EF6\u3002\u786E\u8BA4\u540E\u4F1A\u6E05\u7A7A\u62D6\u62FD\u64A4\u9500\u5386\u53F2\uFF1B\u53D6\u6D88\u6216\u5173\u95ED\u7A97\u53E3\u4E0D\u4FEE\u6539\u6570\u636E\u3002`,
+      `\u5DF2\u68C0\u67E5 ${parsed.length} \u4EFD\u6709\u6548\u6E05\u5355\uFF1B${changedDirectories.length} \u4E2A\u76EE\u5F55\u7684\u987A\u5E8F\u5C06\u53D8\u5316\uFF0C${changedPositions} \u4E2A\u663E\u793A\u4F4D\u7F6E\u4E0D\u540C\u3002${changedDirectories.length ? previewLines.join("\uFF1B") + (changedDirectories.length > 10 ? "\uFF1B\u5176\u4F59\u76EE\u5F55\u7701\u7565" : "") : "\u5F53\u524D\u53EF\u5339\u914D\u9879\u76EE\u7684\u663E\u793A\u987A\u5E8F\u4E0E\u6E05\u5355\u4E00\u81F4\u3002"} ${problems.length ? `\u53E6\u6709 ${problems.length} \u9879\u6E05\u5355\u5DEE\u5F02\uFF1A${problems.slice(0, 10).join("\uFF1B")}${problems.length > 10 ? "\uFF1B\u5176\u4F59\u7701\u7565" : ""}\u3002\u7EE7\u7EED\u4EC5\u5904\u7406\u80FD\u591F\u5339\u914D\u7684\u9879\u76EE\u3002` : "\u672A\u53D1\u73B0\u6E05\u5355\u5DEE\u5F02\u3002"} ${newManifests ? `${newManifests} \u4EFD\u6E05\u5355\u4E3A\u9996\u6B21\u4F7F\u7528\uFF0C\u5C06\u6309\u73B0\u6709\u89C4\u5219\u91C7\u7528\u6E05\u5355\u91CC\u7684 GUID \u5E76\u5EFA\u7ACB\u7D22\u5F15\uFF1BMarkdown \u6B63\u6587\u4E0D\u6539\u5199\u3002` : "\u4EC5\u6062\u590D\u987A\u5E8F\uFF0C\u4E0D\u8986\u76D6\u540E\u6765\u66F4\u6362\u7684 GUID\u3002"} ${matchingCaveat}\u4E0D\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u5B9E\u9645\u6587\u4EF6\u3002\u786E\u8BA4\u540E\u4F1A\u6E05\u7A7A\u62D6\u62FD\u64A4\u9500\u5386\u53F2\uFF1B\u53D6\u6D88\u6216\u5173\u95ED\u7A97\u53E3\u4E0D\u4FEE\u6539\u6570\u636E\u3002`,
       problems.length ? "\u786E\u8BA4\u6062\u590D\u5339\u914D\u9879" : "\u786E\u8BA4\u6062\u590D\u76EE\u5F55\u987A\u5E8F",
-      resolve
+      resolve,
+      renderManifestRestoreDetails
     ).open());
     if (!proceed) return;
     if (this.identityMaintenanceInProgress || JSON.stringify(this.data) !== dataBeforeConfirmation || fileState() !== filesBeforeConfirmation) {
-      new import_obsidian.Notice("\u786E\u8BA4\u671F\u95F4\u6587\u4EF6\u3001\u8EAB\u4EFD\u6216\u76EE\u5F55\u987A\u5E8F\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u540E\u6062\u590D");
+      new import_obsidian.Notice("\u786E\u8BA4\u671F\u95F4\u6587\u4EF6\u3001GUID \u6216\u76EE\u5F55\u987A\u5E8F\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u540E\u6062\u590D");
       return;
     }
     this.identityMaintenanceInProgress = true;
@@ -3438,6 +3540,10 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  /** 给设置项加一个"?"按钮，点击后显示完整说明。 */
+  addDetails(setting, title, paragraphs) {
+    setting.addExtraButton((button) => button.setIcon("help").setTooltip("\u67E5\u770B\u8BE6\u7EC6\u8BF4\u660E").onClick(() => new SettingDetailsModal(this.app, title, paragraphs).open()));
+  }
   display() {
     const { containerEl } = this;
     containerEl.empty();
@@ -3449,7 +3555,7 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.data.settings.newItemPlacement = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u672A\u8BB0\u5F55\u9879\u515C\u5E95\u6392\u5E8F").setDesc("\u6CA1\u6709\u51FA\u73B0\u5728\u987A\u5E8F\u5217\u8868\u4E2D\u7684\u9879\u6309\u540D\u79F0\u6392\u5E8F\uFF0C\u5E76\u6392\u5728\u5DF2\u8BB0\u5F55\u9879\u4E4B\u540E\u3002").addDropdown((dropdown) => dropdown.addOption("name-last", "\u6309\u540D\u79F0\uFF0C\u6392\u5728\u672B\u5C3E").addOption("name", "\u6309\u540D\u79F0").setValue(this.plugin.data.settings.fallbackSort).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("\u672A\u8BB0\u5F55\u9879\u515C\u5E95\u6392\u5E8F").setDesc("\u987A\u5E8F\u5217\u8868\u91CC\u6CA1\u6709\u8BB0\u5F55\u7684\u9879\u76EE\u5982\u4F55\u6392\u5217\u3002").addDropdown((dropdown) => dropdown.addOption("name-last", "\u6309\u540D\u79F0\uFF0C\u6392\u5728\u672B\u5C3E").addOption("name", "\u6309\u540D\u79F0").setValue(this.plugin.data.settings.fallbackSort).onChange(async (value) => {
       this.plugin.data.settings.fallbackSort = value;
       await this.plugin.saveSettings();
       this.plugin.refreshExplorer();
@@ -3458,30 +3564,63 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.data.settings.persistOrderOnCreateDelete = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u542F\u7528\u6587\u4EF6\u6811\u62D6\u62FD").setDesc("\u62D6\u5230\u6807\u9898\u884C\u4E0A\u90E8\u6216\u4E0B\u90E8\u53EF\u7CBE\u786E\u63D2\u5165\uFF1B\u62D6\u5230\u4E2D\u90E8\u53EF\u79FB\u5165\u6587\u4EF6\u5939\u6216\u6587\u4EF6\u5939\u7B14\u8BB0\u3002\u62D6\u52A8\u65F6\u4F1A\u663E\u793A\u63D2\u5165\u7EBF\u548C\u52A8\u4F5C\u63D0\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.enableDrag).onChange(async (value) => {
+    const dragSetting = new import_obsidian.Setting(containerEl).setName("\u542F\u7528\u6587\u4EF6\u6811\u62D6\u62FD").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u6587\u4EF6\u6811\u91CC\u62D6\u62FD\u8C03\u6574\u987A\u5E8F\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.enableDrag).onChange(async (value) => {
       this.plugin.data.settings.enableDrag = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("GUID \u968F\u673A\u4F4D\u6570").setDesc("\u540E\u7F00\u4EC5\u542B\u6570\u5B57\u548C\u5B57\u6BCD\uFF1A64 bit \u4E3A 11 \u4F4D\uFF0C72 bit \u4E3A 13 \u4F4D\u3002\u65B0\u9879\u76EE\u548C\u7EF4\u62A4\u64CD\u4F5C\u4F7F\u7528\u6B64\u8BBE\u7F6E\u3002").addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit").setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
+    this.addDetails(dragSetting, "\u542F\u7528\u6587\u4EF6\u6811\u62D6\u62FD", [
+      "\u62D6\u5230\u6807\u9898\u884C\u7684\u4E0A 30% \u6216\u4E0B 30% \u53EF\u7CBE\u786E\u63D2\u5165\u5230\u76EE\u6807\u4E0A\u65B9\u6216\u4E0B\u65B9\uFF1B\u62D6\u5230\u4E2D\u95F4 40% \u53EF\u79FB\u5165\u6587\u4EF6\u5939\u6216\u6587\u4EF6\u5939\u7B14\u8BB0\u3002",
+      "\u62D6\u52A8\u8FC7\u7A0B\u4E2D\u4F1A\u663E\u793A\u63D2\u5165\u7EBF\u548C\u52A8\u4F5C\u63D0\u793A\uFF0C\u677E\u624B\u540E\u7ACB\u5373\u751F\u6548\u3002",
+      "\u521A\u5B8C\u6210\u7684\u62D6\u62FD\u53EF\u7528\u547D\u4EE4\u201C\u64A4\u9500\u4E0A\u4E00\u6B21\u8BED\u96C0\u62D6\u62FD\u201D\u8FD8\u539F\u3002"
+    ]);
+    new import_obsidian.Setting(containerEl).setName("GUID \u968F\u673A\u4F4D\u6570").setDesc("\u65B0 GUID \u7684\u968F\u673A\u540E\u7F00\u957F\u5EA6\u3002").addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit").setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
       this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u542F\u52A8\u65F6\u68C0\u6D4B\u91CD\u590D GUID").setDesc("\u9ED8\u8BA4\u5173\u95ED\u3002\u5F00\u542F\u540E\u53EA\u8BFB\u68C0\u6D4B\u5E76\u63D0\u793A\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u4FEE\u6539\u6587\u4EF6\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("\u542F\u52A8\u65F6\u68C0\u6D4B\u91CD\u590D GUID").setDesc("\u542F\u52A8\u65F6\u53EA\u8BFB\u68C0\u6D4B\u91CD\u590D GUID \u5E76\u63D0\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
       this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").setDesc("\u65B0\u6E05\u5355\u9996\u6B21\u91C7\u7528\u5BFC\u51FA\u8EAB\u4EFD\u548C\u987A\u5E8F\uFF1B\u518D\u6B21\u6267\u884C\u4EC5\u6062\u590D\u987A\u5E8F\uFF0C\u4E0D\u8986\u76D6\u4E4B\u540E\u66F4\u6362\u7684 GUID\u3002").addButton((button) => button.setButtonText("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").onClick(() => void this.plugin.requestManifestImport()));
-    new import_obsidian.Setting(containerEl).setName("\u68C0\u6D4B\u672A\u7BA1\u7406\u9879\u76EE").setDesc("\u53EA\u8BFB\u626B\u63CF\u6574\u4E2A Vault\uFF1B\u786E\u8BA4\u540E\u624D\u4E3A\u7F3A\u5C11 GUID \u7684\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u751F\u6210\u8EAB\u4EFD\u3002\u63D2\u4EF6\u8FD0\u884C\u671F\u95F4\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u901A\u5E38\u5DF2\u88AB\u5B9E\u65F6\u81EA\u52A8\u7EB3\u5165\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u7EB3\u5165\u7BA1\u7406").onClick(() => void this.plugin.auditAndOfferManagement()));
-    new import_obsidian.Setting(containerEl).setName("\u5C06\u5F53\u524D\u5E93\u4E2D\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939\u7EB3\u5165\u672C\u63D2\u4EF6\u7BA1\u7406").setDesc("\u4E3A\u6307\u5B9A\u6587\u4EF6\u6216\u6587\u4EF6\u5939\uFF08\u5305\u542B\u6587\u4EF6\u5939\u672C\u8EAB\u548C\u6587\u4EF6\u5939\u4E0B\u7684\u5185\u5BB9\uFF09\u751F\u6210\u7F3A\u5931 GUID\uFF0C\u6216\u91CD\u65B0\u751F\u6210GUID\u5E76\u5EFA\u7ACB\u6392\u5E8F\u7D22\u5F15\uFF0C\u4FEE\u6539\u540E\u4E0D\u6539\u53D8\u539F\u4F4D\u7F6E\u3002\u8BE5\u529F\u80FD\u4E5F\u53EF\u7528\u4F5C\u91CD\u7F6E\u6392\u5E8F\u7D22\u5F15\u3002").addButton((button) => button.setButtonText("\u9009\u62E9\u6587\u4EF6\u548C\u6587\u4EF6\u5939").onClick(() => this.plugin.openIdentitySelection()));
-    new import_obsidian.Setting(containerEl).setName("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").setDesc("\u9009\u62E9\u6E90\u5E93\u548C\u5F53\u524D\u5E93\u4E2D\u7684\u76EE\u6807\u76EE\u5F55\uFF0C\u9884\u68C0\u540C\u540D\u51B2\u7A81\uFF1B\u652F\u6301\u6574\u9879\u66FF\u6362\u3001\u91CD\u547D\u540D\u548C\u7F16\u53F7\u3002\u6BCF\u6B21\u64CD\u4F5C\u4F1A\u5728\u63D2\u4EF6\u76EE\u5F55\u751F\u6210 local-copy-* \u5907\u4EFD\u4E0E\u8BB0\u5F55\u6587\u4EF6\u5939\u3002\u786E\u8BA4\u590D\u5236\u7ED3\u679C\u3001\u6392\u5E8F\u90FD\u6B63\u5E38\uFF0C\u4E14\u4E0D\u518D\u9700\u8981\u6062\u590D\u8BB0\u5F55\u540E\uFF0C\u53EF\u4EE5\u5220\u9664\u5BF9\u5E94\u7684 local-copy-* \u6587\u4EF6\u5939\uFF08\u4F8B\u5982 local-copy-DJKYhp\uFF09\uFF1B\u4E0D\u8981\u5220\u9664\u63D2\u4EF6\u76EE\u5F55\u4E2D\u6B63\u5728\u4F7F\u7528\u7684 data.json\u3002").addButton((button) => button.setButtonText("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").onClick(() => this.plugin.openLocalCopy()));
-    new import_obsidian.Setting(containerEl).setName("\u63A5\u7BA1\u5386\u53F2 Obsidian Vault").setDesc("\u7528\u4E8E\u6CA1\u6709 GUID\u3001\u6CA1\u6709\u63D2\u4EF6 data.json \u7684\u65E7\u5E93\uFF1A\u8865\u5168\u7F3A\u5931\u8EAB\u4EFD\u4E0E\u76EE\u5F55\u7D22\u5F15\uFF0C\u5E76\u6309\u5F53\u524D\u663E\u793A\u7ED3\u6784\u91CD\u5EFA\u987A\u5E8F\uFF1B\u4E0D\u79FB\u52A8\u6216\u91CD\u547D\u540D\u6587\u4EF6\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u63A5\u7BA1\u5386\u53F2\u5E93").onClick(() => void this.plugin.takeOverHistoricalVault()));
-    new import_obsidian.Setting(containerEl).setName("\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0").setDesc("\u4EC5\u5339\u914D\u4F4D\u4E8E\u540C\u540D\u6587\u4EF6\u5939\u5185\u3001\u4E14 f-/d- GUID \u540E\u7F00\u76F8\u540C\u7684 Markdown\u3002\u540D\u79F0\u65C1\u7684 \u2197 \u8868\u793A\u5DF2\u5408\u5E76\uFF0C\u70B9\u51FB\u6807\u9898\u6253\u5F00\u6587\u6863\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
+    const restoreSetting = new import_obsidian.Setting(containerEl).setName("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").setDesc("\u6309\u8BED\u96C0\u5BFC\u51FA\u6E05\u5355\u6062\u590D\u76EE\u5F55\u987A\u5E8F\uFF1B\u53EA\u6309\u8DEF\u5F84\u5339\u914D\uFF0C\u4E0D\u6539\u52A8\u6587\u4EF6\u4E0E GUID\u3002").addButton((button) => button.setButtonText("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").onClick(() => void this.plugin.requestManifestImport()));
+    this.addDetails(restoreSetting, "\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F", [
+      "\u8BFB\u53D6\u5E93\u91CC\u7684 _yuque_order.json\uFF08\u8BED\u96C0\u5BFC\u51FA\u6E05\u5355\uFF09\uFF0C\u628A\u5404\u76EE\u5F55\u7684\u663E\u793A\u987A\u5E8F\u8C03\u56DE\u8BED\u96C0\u91CC\u7684\u539F\u987A\u5E8F\u3002",
+      "\u9996\u6B21\u4F7F\u7528\u67D0\u4EFD\u6E05\u5355\u65F6\u4F1A\u4E00\u5E76\u91C7\u7528\u6E05\u5355\u91CC\u7684 GUID\uFF1B\u4E4B\u540E\u518D\u6B21\u6267\u884C\u53EA\u8C03\u987A\u5E8F\uFF0C\u4E0D\u6539\u52A8\u4F60\u540E\u6765\u66F4\u6362\u8FC7\u7684 GUID\u3002",
+      "\u5339\u914D\u53EA\u770B\u6E05\u5355\u4E2D\u7684\u8DEF\u5F84\uFF0C\u4E0D\u770B\u6587\u4EF6\u5185\u5BB9\uFF1A\u5DF2\u6539\u540D\u6216\u79FB\u52A8\u8FC7\u7684\u9879\u76EE\u65E0\u6CD5\u6062\u590D\u539F\u987A\u5E8F\uFF08\u4F1A\u63D0\u793A\u7F3A\u5931/\u591A\u51FA\uFF09\uFF1B\u540C\u4E00\u8DEF\u5F84\u82E5\u5DF2\u6362\u6210\u53E6\u4E00\u4E2A\u6587\u4EF6\uFF0C\u63D2\u4EF6\u4E0D\u4F1A\u8BC6\u522B\uFF0C\u4F1A\u76F4\u63A5\u6309\u6E05\u5355\u4F4D\u7F6E\u6392\u5E8F\u3002",
+      "\u4E0D\u4F1A\u65B0\u5EFA\u3001\u5220\u9664\u3001\u91CD\u547D\u540D\u6216\u79FB\u52A8\u6587\u4EF6\u3002\u53EA\u6709\u70B9\u6B64\u6309\u94AE\u6216\u547D\u4EE4\u624D\u4F1A\u6267\u884C\uFF0C\u542F\u52A8\u65F6\u7EDD\u4E0D\u81EA\u52A8\u5E94\u7528\u3002"
+    ]);
+    const auditSetting = new import_obsidian.Setting(containerEl).setName("\u68C0\u6D4B\u672A\u7BA1\u7406\u9879\u76EE").setDesc("\u53EA\u8BFB\u626B\u63CF\u6574\u4E2A Vault\uFF0C\u786E\u8BA4\u540E\u4E3A\u672A\u7EB3\u5165\u7BA1\u7406\u7684\u9879\u76EE\u751F\u6210 GUID\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u7EB3\u5165\u7BA1\u7406").onClick(() => void this.plugin.auditAndOfferManagement()));
+    this.addDetails(auditSetting, "\u68C0\u6D4B\u672A\u7BA1\u7406\u9879\u76EE", [
+      "\u626B\u63CF\u672C\u8EAB\u53EA\u8BFB\uFF0C\u4E0D\u4F1A\u4FEE\u6539\u4EFB\u4F55\u6587\u4EF6\uFF1B\u53EA\u6709\u786E\u8BA4\u540E\u624D\u4F1A\u4E3A\u7F3A\u5C11 GUID \u7684\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u751F\u6210 GUID\u3002",
+      "\u63D2\u4EF6\u8FD0\u884C\u671F\u95F4\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u901A\u5E38\u5DF2\u88AB\u5B9E\u65F6\u81EA\u52A8\u7EB3\u5165\uFF0C\u56E0\u6B64\u626B\u63CF\u7ED3\u679C\u53EF\u80FD\u4E3A\u96F6\u3002"
+    ]);
+    const manageSetting = new import_obsidian.Setting(containerEl).setName("\u5C06\u5F53\u524D\u5E93\u4E2D\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939\u7EB3\u5165\u672C\u63D2\u4EF6\u7BA1\u7406").setDesc("\u4E3A\u9009\u4E2D\u7684\u9879\u76EE\u8865\u9F50\u6216\u91CD\u65B0\u751F\u6210 GUID\u3002").addButton((button) => button.setButtonText("\u9009\u62E9\u6587\u4EF6\u548C\u6587\u4EF6\u5939").onClick(() => this.plugin.openIdentitySelection()));
+    this.addDetails(manageSetting, "\u5C06\u5F53\u524D\u5E93\u4E2D\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939\u7EB3\u5165\u672C\u63D2\u4EF6\u7BA1\u7406", [
+      "\u8303\u56F4\u5305\u542B\u6240\u9009\u6587\u4EF6\u5939\u672C\u8EAB\u4EE5\u53CA\u6587\u4EF6\u5939\u4E0B\u7684\u5168\u90E8\u5185\u5BB9\u3002",
+      "\u53EF\u53EA\u751F\u6210\u7F3A\u5931\u7684 GUID\uFF0C\u4E5F\u53EF\u91CD\u65B0\u751F\u6210\u9009\u4E2D\u9879\u76EE\u7684 GUID \u5E76\u5EFA\u7ACB\u6392\u5E8F\u7D22\u5F15\uFF1B\u4FEE\u6539\u540E\u4E0D\u6539\u53D8\u539F\u4F4D\u7F6E\u3002",
+      "\u8BE5\u529F\u80FD\u4E5F\u53EF\u7528\u4F5C\u91CD\u7F6E\u6392\u5E8F\u7D22\u5F15\u3002"
+    ]);
+    const transferSetting = new import_obsidian.Setting(containerEl).setName("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").setDesc("\u4ECE\u53E6\u4E00\u4E2A Vault \u6216\u76EE\u5F55\u590D\u5236\u6587\u4EF6\u4E0E\u987A\u5E8F\uFF0C\u51B2\u7A81\u53EF\u66FF\u6362\u3001\u91CD\u547D\u540D\u6216\u7F16\u53F7\u3002").addButton((button) => button.setButtonText("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").onClick(() => this.plugin.openLocalCopy()));
+    this.addDetails(transferSetting, "\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09", [
+      "\u9009\u62E9\u6E90\u5E93\u548C\u5F53\u524D\u5E93\u4E2D\u7684\u76EE\u6807\u76EE\u5F55\uFF0C\u9884\u68C0\u540C\u540D\u51B2\u7A81\u540E\u518D\u6267\u884C\uFF1B\u652F\u6301\u6574\u9879\u66FF\u6362\u3001\u91CD\u547D\u540D\u548C\u7F16\u53F7\u3002",
+      "\u6BCF\u6B21\u64CD\u4F5C\u4F1A\u5728\u63D2\u4EF6\u76EE\u5F55\u751F\u6210 local-copy-* \u5907\u4EFD\u4E0E\u8BB0\u5F55\u6587\u4EF6\u5939\u3002",
+      "\u786E\u8BA4\u590D\u5236\u7ED3\u679C\u548C\u6392\u5E8F\u90FD\u6B63\u5E38\u3001\u4E14\u4E0D\u518D\u9700\u8981\u6062\u590D\u8BB0\u5F55\u540E\uFF0C\u53EF\u4EE5\u5220\u9664\u5BF9\u5E94\u7684 local-copy-* \u6587\u4EF6\u5939\uFF08\u4F8B\u5982 local-copy-DJKYhp\uFF09\uFF1B\u4E0D\u8981\u5220\u9664\u63D2\u4EF6\u76EE\u5F55\u4E2D\u6B63\u5728\u4F7F\u7528\u7684 data.json\u3002"
+    ]);
+    const legacySetting = new import_obsidian.Setting(containerEl).setName("\u63A5\u7BA1\u5386\u53F2 Obsidian Vault").setDesc("\u4E3A\u6CA1\u6709 GUID \u7684\u65E7\u5E93\u8865\u9F50 GUID \u5E76\u91CD\u5EFA\u76EE\u5F55\u7D22\u5F15\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u63A5\u7BA1\u5386\u53F2\u5E93").onClick(() => void this.plugin.takeOverHistoricalVault()));
+    this.addDetails(legacySetting, "\u63A5\u7BA1\u5386\u53F2 Obsidian Vault", [
+      "\u9002\u7528\u4E8E\u6CA1\u6709 GUID\u3001\u6CA1\u6709\u63D2\u4EF6 data.json \u7684\u65E7\u5E93\u3002",
+      "\u8865\u5168\u7F3A\u5931\u7684 GUID \u4E0E\u76EE\u5F55\u7D22\u5F15\uFF0C\u5E76\u6309\u5F53\u524D\u663E\u793A\u7ED3\u6784\u91CD\u5EFA\u987A\u5E8F\uFF1B\u4E0D\u79FB\u52A8\u6216\u91CD\u547D\u540D\u6587\u4EF6\u3002"
+    ]);
+    const mergeSetting = new import_obsidian.Setting(containerEl).setName("\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0").setDesc("\u628A\u914D\u5BF9\u7684\u6587\u4EF6\u5939\u7B14\u8BB0\u5408\u5E76\u5230\u4E00\u884C\u663E\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
       this.plugin.data.settings.mergePairedFolderNotes = value;
       await this.plugin.saveSettings();
       this.plugin.refreshExplorer();
     }));
+    this.addDetails(mergeSetting, "\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0", [
+      "\u4EC5\u5339\u914D\u4F4D\u4E8E\u540C\u540D\u6587\u4EF6\u5939\u5185\u3001\u4E14 f-/d- GUID \u540E\u7F00\u76F8\u540C\u7684 Markdown\u3002",
+      "\u540D\u79F0\u65C1\u7684 \u2197 \u8868\u793A\u5DF2\u5408\u5E76\uFF0C\u70B9\u51FB\u6807\u9898\u6253\u5F00\u6587\u6863\u3002"
+    ]);
     new import_obsidian.Setting(containerEl).setName("\u91CD\u590D GUID").setDesc("\u6309\u5B8C\u6574 GUID \u68C0\u6D4B\uFF1B\u4FEE\u590D\u65F6\u4FDD\u7559\u5F53\u524D\u987A\u5E8F\u4E2D\u7684\u9996\u9879\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u4FEE\u590D").onClick(() => void this.plugin.checkDuplicateGuids(true)));
-    new import_obsidian.Setting(containerEl).setName("\u5168\u5E93\u66F4\u6362 GUID").setDesc("\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u6362\u53F7\uFF0C\u521B\u5EFA\u6062\u590D\u70B9\u5E76\u4FDD\u6301\u76EE\u5F55\u987A\u5E8F\u3002").addButton((button) => button.setButtonText("\u4E0D\u5907\u4EFD").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false))).addButton((button) => button.setButtonText("\u66F4\u6362\u5E76\u5907\u4EFD").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
+    new import_obsidian.Setting(containerEl).setName("\u5168\u5E93\u66F4\u6362 GUID").setDesc("\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u6362\u53F7\uFF0C\u53EF\u9009\u62E9\u662F\u5426\u521B\u5EFA\u6062\u590D\u70B9\u3002").addButton((button) => button.setButtonText("\u4E0D\u5907\u4EFD").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false))).addButton((button) => button.setButtonText("\u66F4\u6362\u5E76\u5907\u4EFD").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
     if (this.plugin.data.guidBackups.length) {
       containerEl.createEl("h3", { text: "GUID \u6062\u590D\u70B9\uFF08\u6700\u591A 3 \u4EFD\uFF09" });
       [...this.plugin.data.guidBackups].reverse().forEach((backup) => {

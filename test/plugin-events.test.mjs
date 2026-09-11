@@ -186,6 +186,22 @@ test('manifest restore does not apply a preview after the user changes order dur
   assert.equal(plugin.data.orderByFolder['d-kkkkkkkkkkk'][0], 'f-manifest');
   assert.deepEqual(counts(), { saves: 0, refreshes: 0 });
 });
+test('manifest restore reports unreadable manifests as unparseable without format jargon', async (t) => {
+  const { plugin, target } = await manifestFixture(t);
+  await fs.promises.mkdir(path.join(target, 'kb', 'legacy'));
+  await fs.promises.writeFile(path.join(target, 'kb', 'legacy', '_yuque_order.json'), JSON.stringify({ version: 1, tree: [] }));
+  await fs.promises.mkdir(path.join(target, 'kb', 'broken'));
+  await fs.promises.writeFile(path.join(target, 'kb', 'broken', '_yuque_order.json'), '{ oops');
+  modalChoice.accept = false;
+  try { await plugin.requestManifestImport(); } finally { modalChoice.accept = true; }
+  const message = confirmationMessages.at(-1);
+  assert.match(message, /kb\/legacy\/_yuque_order\.json：无法解析/);
+  assert.match(message, /kb\/broken\/_yuque_order\.json：无法解析/);
+  assert.doesNotMatch(message, /v2/);
+  // 已消费清单再次执行时只按路径匹配，文案必须把这一点和它的后果说清楚。
+  assert.match(message, /匹配只看清单中的路径/);
+  assert.match(message, /同一路径若已换成另一个文件/);
+});
 test('absolute missing nested target is created with GUIDs and keeps root siblings in place', async t => {
   const { plugin, source, target, counts } = await autoCopyFixture(t);
   await plugin.copyLocalDirectory(source, path.join(target, 'notes', 'imported'));

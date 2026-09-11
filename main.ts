@@ -54,6 +54,7 @@ import { checkedDirectory, contained, copyMarkdown, copyPathMap, installCopies, 
 import { chooseDirectory } from "./src/directory-picker";
 import type { CopyChoice, LocalRuntime, DiskEntry } from "./src/local-copy";
 import { sourceTransfer, yamlObject } from "./src/local-source";
+import { renderManifestRestoreView } from "./src/manifest-restore-view";
 const MANIFEST_NAME = "_yuque_order.json";
 const GUID_FRONTMATTER_KEY = "guid";
 
@@ -207,16 +208,35 @@ class ManifestImportConfirmModal extends Modal {
 
 class ConfirmActionModal extends Modal {
   private settled = false;
-  constructor(app: App, private titleText: string, private message: string, private confirmText: string, private resolveChoice: (choice: boolean) => void) { super(app); }
+  constructor(
+    app: App,
+    private titleText: string,
+    private message: string,
+    private confirmText: string,
+    private resolveChoice: (choice: boolean) => void,
+    private renderDetails?: (contentEl: HTMLElement) => void,
+  ) { super(app); }
   onOpen(): void {
     this.setTitle(this.titleText);
-    this.contentEl.createEl("p", { text: this.message });
+    if (this.renderDetails) this.renderDetails(this.contentEl);
+    else this.contentEl.createEl("p", { text: this.message });
     new Setting(this.contentEl)
       .addButton((button) => button.setButtonText("取消").onClick(() => this.finish(false)))
       .addButton((button) => button.setButtonText(this.confirmText).setWarning().onClick(() => this.finish(true)));
   }
   onClose(): void { this.contentEl.empty(); if (!this.settled) this.resolveChoice(false); }
   private finish(choice: boolean): void { if (this.settled) return; this.settled = true; this.resolveChoice(choice); this.close(); }
+}
+
+/** 设置页只显示一句话简介，详细说明放在这里按需打开。 */
+class SettingDetailsModal extends Modal {
+  constructor(app: App, private titleText: string, private paragraphs: string[]) { super(app); }
+  onOpen(): void {
+    this.setTitle(this.titleText);
+    const body = this.contentEl.createDiv({ cls: "yq-setting-details" });
+    this.paragraphs.forEach((paragraph) => body.createEl("p", { text: paragraph }));
+  }
+  onClose(): void { this.contentEl.empty(); }
 }
 
 class CopyConflictModal extends Modal {
@@ -999,7 +1019,7 @@ export default class YqOrderDragPlugin extends Plugin {
     const proceed = await new Promise<boolean>((resolve) => new ConfirmActionModal(
       this.app,
       "检测到未管理项目",
-      `发现 ${fileCount} 个文件和 ${unmanaged.length - fileCount} 个文件夹。将只为缺失身份的项目生成 GUID，并按新增项规则纳入管理；已有兄弟项相对顺序不变。`,
+      `发现 ${fileCount} 个文件和 ${unmanaged.length - fileCount} 个文件夹。将只为缺少 GUID 的项目生成 GUID，并按新增项规则纳入管理；已有兄弟项相对顺序不变。`,
       "生成 GUID 并纳入管理",
       resolve,
     ).open());
@@ -1011,14 +1031,14 @@ export default class YqOrderDragPlugin extends Plugin {
     const unmanaged = await this.collectUnmanagedItems();
     const unindexed = this.collectUnindexedItems();
     if (!unmanaged.length && !unindexed.length) {
-      new Notice("当前 Vault 的身份和目录索引均完整；复制或新建的项目已被实时自动接管");
+      new Notice("当前 Vault 的 GUID 和目录索引均完整；复制或新建的项目已被实时自动接管");
       return;
     }
     const currentOrder = this.collectIdentityState().folderChildrenByPath;
     const proceed = await new Promise<boolean>((resolve) => new ConfirmActionModal(
       this.app,
       "接管历史 Obsidian Vault",
-      `发现 ${unmanaged.length} 个项目缺少 GUID、${unindexed.length} 个项目缺少目录索引。${unindexed.length ? `缺少索引：${unindexed.slice(0, 10).map((item) => item.path).join("；")}${unindexed.length > 10 ? `；另有 ${unindexed.length - 10} 项` : ""}。` : ""}将补全身份，并以当前显示结构一次性重建目录索引；不会移动、重命名或删除文件。`,
+      `发现 ${unmanaged.length} 个项目缺少 GUID、${unindexed.length} 个项目缺少目录索引。${unindexed.length ? `缺少索引：${unindexed.slice(0, 10).map((item) => item.path).join("；")}${unindexed.length > 10 ? `；另有 ${unindexed.length - 10} 项` : ""}。` : ""}将补全缺失的 GUID，并以当前显示结构一次性重建目录索引；不会移动、重命名或删除文件。`,
       "开始接管",
       resolve,
     ).open());
@@ -1133,10 +1153,10 @@ export default class YqOrderDragPlugin extends Plugin {
       const reservedGuids = new Set([...occupied, ...replacements.values()]);
       for (const path of targetPlan.missing) missingGuids.set(path, createGuid("d", this.data.settings.guidBits, reservedGuids));
       const confirm = await new Promise<boolean>(resolve => new ConfirmActionModal(this.app, targetPlan.missing.length ? `确认自动复制：将创建 ${targetPlan.missing.join("、")}` : "确认自动复制",
-        `来源：${source}；目标：${destination || "Vault 根目录"}。复制 ${pack.items.length} 项，${remapped} 个冲突或重复 GUID 换号，${sourceInfo.generated} 项补身份，${sourceInfo.fallback} 项无来源索引、按名称兜底。${replacedRoots.size} 个同名项将整项替换，目标原 ${removedCount} 项（含目标独有子项）移入备份，不递归混合。计划：${roots.slice(0, 30).map(root => `${root.source} → ${root.target}${root.replaces ? " [整项替换]" : ""}`).join("；")}${roots.length > 30 ? "；其余省略" : ""}。替换项沿用原位置，新项按新增位置设置插入，其他兄弟项顺序不变。重命名可能影响相对链接，不自动改写正文链接。请先关闭被替换的笔记，并暂停同步或其他编辑。`, "确认复制（替换项已备份后才执行）", resolve).open());
+        `来源：${source}；目标：${destination || "Vault 根目录"}。复制 ${pack.items.length} 项，${remapped} 个冲突或重复 GUID 换号，${sourceInfo.generated} 项补 GUID，${sourceInfo.fallback} 项无来源索引、按名称兜底。${replacedRoots.size} 个同名项将整项替换，目标原 ${removedCount} 项（含目标独有子项）移入备份，不递归混合。计划：${roots.slice(0, 30).map(root => `${root.source} → ${root.target}${root.replaces ? " [整项替换]" : ""}`).join("；")}${roots.length > 30 ? "；其余省略" : ""}。替换项沿用原位置，新项按新增位置设置插入，其他兄弟项顺序不变。重命名可能影响相对链接，不自动改写正文链接。请先关闭被替换的笔记，并暂停同步或其他编辑。`, "确认复制（替换项已备份后才执行）", resolve).open());
       if (!confirm) return;
       checkCancelled();
-      if (this.identityMaintenanceInProgress || this.data !== originalData || JSON.stringify(this.data) !== dataSnapshot) throw new Error("预检后身份或排序变化，请重新预检");
+      if (this.identityMaintenanceInProgress || this.data !== originalData || JSON.stringify(this.data) !== dataSnapshot) throw new Error("预检后 GUID 或排序变化，请重新预检");
       this.app.workspace.iterateAllLeaves(leaf => {
         const path = (leaf.view as any)?.file?.path;
         if (path && inReplacement(path)) throw new Error(`请先关闭被替换的已打开文件：${path}`);
@@ -1633,7 +1653,7 @@ export default class YqOrderDragPlugin extends Plugin {
         return now?.kind === entry.kind && now.guid === entry.replacementGuid;
       });
       if (!valid) { new Notice("无法恢复：当前库已有新增、删除、移动、重命名或 GUID 变化"); return; }
-      const proceed = await new Promise<boolean>((resolve) => new ConfirmActionModal(this.app, "恢复 GUID", `恢复 ${meta.createdAt} 的 ${meta.count} 项身份和目录顺序。`, "恢复", resolve).open());
+      const proceed = await new Promise<boolean>((resolve) => new ConfirmActionModal(this.app, "恢复 GUID", `恢复 ${meta.createdAt} 的 ${meta.count} 项 GUID 和目录顺序。`, "恢复", resolve).open());
       if (!proceed) return;
       this.identityMaintenanceInProgress = true;
       await mapLimit(backup.entries, 4, async (entry) => {
@@ -1675,9 +1695,9 @@ export default class YqOrderDragPlugin extends Plugin {
       try {
         const raw = JSON.parse(await this.app.vault.read(file));
         if (raw?.version !== 2 || typeof raw.exportId !== "string" || !Array.isArray(raw.directories)) {
-          problems.push(`${file.path}：不是 v2 清单`);
+          problems.push(`${file.path}：无法解析`);
         } else parsed.push({ file, raw });
-      } catch { problems.push(`${file.path}：JSON 无效`); }
+      } catch { problems.push(`${file.path}：无法解析`); }
     }
     if (!parsed.length) {
       new Notice(problems.length ? problems[0] : "没有可用的语雀导出清单");
@@ -1787,6 +1807,7 @@ export default class YqOrderDragPlugin extends Plugin {
     const changedDirectories: string[] = [];
     let changedPositions = 0;
     const previewLines: string[] = [];
+    const previews: Array<{ folder: string; current: string; next: string }> = [];
     for (const { file, raw } of parsed) {
       const root = file.parent?.path || "";
       for (const directory of raw.directories) {
@@ -1801,10 +1822,13 @@ export default class YqOrderDragPlugin extends Plugin {
         const next = [...listed, ...current.filter(path => !listedSet.has(path))];
         const changed = next.reduce((count, path, index) => count + (current[index] !== path ? 1 : 0), 0);
         if (!changed) continue;
-        changedDirectories.push(folderPath || "Vault 根目录"); changedPositions += changed;
+        const folderLabel = folderPath || "Vault 根目录";
+        changedDirectories.push(folderLabel); changedPositions += changed;
         if (previewLines.length < 10) {
           const names = (paths: string[]): string => paths.slice(0, 6).map(path => path.split("/").pop()).join(" → ") + (paths.length > 6 ? " → …" : "");
-          previewLines.push(`${folderPath || "Vault 根目录"}：当前 [${names(current)}]；恢复后 [${names(next)}]`);
+          const currentText = names(current), nextText = names(next);
+          previews.push({ folder: folderLabel, current: currentText, next: nextText });
+          previewLines.push(`${folderLabel}：当前 [${currentText}]；恢复后 [${nextText}]`);
         }
       }
     }
@@ -1812,14 +1836,24 @@ export default class YqOrderDragPlugin extends Plugin {
     const fileState = (): string => JSON.stringify(this.app.vault.getAllLoadedFiles().map(item => [item.path, item instanceof TFile ? [item.stat.mtime, item.stat.size] : "folder"]));
     const filesBeforeConfirmation = fileState();
     const newManifests = parsed.filter(({ raw }) => !this.data.consumedManifestIds.includes(raw.exportId)).length;
+    const matchingCaveat = `匹配只看清单中的路径，不看文件内容：已改名或移动过的项目无法恢复原顺序（会提示缺失/多出）。${newManifests < parsed.length ? "同一路径若已换成另一个文件，插件不会识别，会直接按清单位置排序。" : ""}`;
+    const restoreView = {
+      manifestCount: parsed.length,
+      changedDirectories: changedDirectories.length,
+      changedPositions,
+      previews,
+      problems,
+      newManifests,
+    };
+    const renderManifestRestoreDetails = (contentEl: HTMLElement): void => renderManifestRestoreView(contentEl, restoreView);
     const proceed = await new Promise<boolean>((resolve) => new ConfirmActionModal(
       this.app, "确认恢复原语雀目录顺序",
-      `已检查 ${parsed.length} 份有效清单；${changedDirectories.length} 个目录的顺序将变化，${changedPositions} 个显示位置不同。${changedDirectories.length ? previewLines.join("；") + (changedDirectories.length > 10 ? "；其余目录省略" : "") : "当前可匹配项目的显示顺序与清单一致。"} ${problems.length ? `另有 ${problems.length} 项内容/身份差异：${problems.slice(0, 10).join("；")}${problems.length > 10 ? "；其余省略" : ""}。继续仅处理能够匹配的项目。` : "未发现内容或身份差异。"} ${newManifests ? `${newManifests} 份清单为首次使用，将按现有规则采用导出身份并建立索引；Markdown 正文不改写。` : "仅恢复顺序，不覆盖后来更换的 GUID。"} 不移动、重命名或删除实际文件。确认后会清空拖拽撤销历史；取消或关闭窗口不修改数据。`,
-      problems.length ? "确认恢复匹配项" : "确认恢复目录顺序", resolve,
+      `已检查 ${parsed.length} 份有效清单；${changedDirectories.length} 个目录的顺序将变化，${changedPositions} 个显示位置不同。${changedDirectories.length ? previewLines.join("；") + (changedDirectories.length > 10 ? "；其余目录省略" : "") : "当前可匹配项目的显示顺序与清单一致。"} ${problems.length ? `另有 ${problems.length} 项清单差异：${problems.slice(0, 10).join("；")}${problems.length > 10 ? "；其余省略" : ""}。继续仅处理能够匹配的项目。` : "未发现清单差异。"} ${newManifests ? `${newManifests} 份清单为首次使用，将按现有规则采用清单里的 GUID 并建立索引；Markdown 正文不改写。` : "仅恢复顺序，不覆盖后来更换的 GUID。"} ${matchingCaveat}不移动、重命名或删除实际文件。确认后会清空拖拽撤销历史；取消或关闭窗口不修改数据。`,
+      problems.length ? "确认恢复匹配项" : "确认恢复目录顺序", resolve, renderManifestRestoreDetails,
     ).open());
     if (!proceed) return;
     if (this.identityMaintenanceInProgress || JSON.stringify(this.data) !== dataBeforeConfirmation || fileState() !== filesBeforeConfirmation) {
-      new Notice("确认期间文件、身份或目录顺序发生变化，请重新检查后恢复"); return;
+      new Notice("确认期间文件、GUID 或目录顺序发生变化，请重新检查后恢复"); return;
     }
     this.identityMaintenanceInProgress = true;
     try {
@@ -2836,6 +2870,14 @@ class YqOrderSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  /** 给设置项加一个"?"按钮，点击后显示完整说明。 */
+  private addDetails(setting: Setting, title: string, paragraphs: string[]): void {
+    setting.addExtraButton((button) => button
+      .setIcon("help")
+      .setTooltip("查看详细说明")
+      .onClick(() => new SettingDetailsModal(this.app, title, paragraphs).open()));
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
@@ -2857,7 +2899,7 @@ class YqOrderSettingTab extends PluginSettingTab {
         }));
     new Setting(containerEl)
       .setName("未记录项兜底排序")
-      .setDesc("没有出现在顺序列表中的项按名称排序，并排在已记录项之后。")
+      .setDesc("顺序列表里没有记录的项目如何排列。")
       .addDropdown((dropdown) => dropdown
         .addOption("name-last", "按名称，排在末尾")
         .addOption("name", "按名称")
@@ -2874,16 +2916,21 @@ class YqOrderSettingTab extends PluginSettingTab {
         this.plugin.data.settings.persistOrderOnCreateDelete = value;
         await this.plugin.saveSettings();
       }));
-    new Setting(containerEl)
+    const dragSetting = new Setting(containerEl)
       .setName("启用文件树拖拽")
-      .setDesc("拖到标题行上部或下部可精确插入；拖到中部可移入文件夹或文件夹笔记。拖动时会显示插入线和动作提示。")
+      .setDesc("开启后可在文件树里拖拽调整顺序。")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.enableDrag).onChange(async (value) => {
         this.plugin.data.settings.enableDrag = value;
         await this.plugin.saveSettings();
       }));
+    this.addDetails(dragSetting, "启用文件树拖拽", [
+      "拖到标题行的上 30% 或下 30% 可精确插入到目标上方或下方；拖到中间 40% 可移入文件夹或文件夹笔记。",
+      "拖动过程中会显示插入线和动作提示，松手后立即生效。",
+      "刚完成的拖拽可用命令“撤销上一次语雀拖拽”还原。",
+    ]);
     new Setting(containerEl)
       .setName("GUID 随机位数")
-      .setDesc("后缀仅含数字和字母：64 bit 为 11 位，72 bit 为 13 位。新项目和维护操作使用此设置。")
+      .setDesc("新 GUID 的随机后缀长度。")
       .addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit")
         .setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
           this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
@@ -2891,46 +2938,74 @@ class YqOrderSettingTab extends PluginSettingTab {
         }));
     new Setting(containerEl)
       .setName("启动时检测重复 GUID")
-      .setDesc("默认关闭。开启后只读检测并提示，不会自动修改文件。")
+      .setDesc("启动时只读检测重复 GUID 并提示。")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
         this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
         await this.plugin.saveSettings();
       }));
-    new Setting(containerEl)
+    const restoreSetting = new Setting(containerEl)
       .setName("恢复原语雀目录顺序")
-      .setDesc("新清单首次采用导出身份和顺序；再次执行仅恢复顺序，不覆盖之后更换的 GUID。")
+      .setDesc("按语雀导出清单恢复目录顺序；只按路径匹配，不改动文件与 GUID。")
       .addButton((button) => button.setButtonText("恢复原语雀目录顺序").onClick(() => void this.plugin.requestManifestImport()));
-    new Setting(containerEl)
+    this.addDetails(restoreSetting, "恢复原语雀目录顺序", [
+      "读取库里的 _yuque_order.json（语雀导出清单），把各目录的显示顺序调回语雀里的原顺序。",
+      "首次使用某份清单时会一并采用清单里的 GUID；之后再次执行只调顺序，不改动你后来更换过的 GUID。",
+      "匹配只看清单中的路径，不看文件内容：已改名或移动过的项目无法恢复原顺序（会提示缺失/多出）；同一路径若已换成另一个文件，插件不会识别，会直接按清单位置排序。",
+      "不会新建、删除、重命名或移动文件。只有点此按钮或命令才会执行，启动时绝不自动应用。",
+    ]);
+    const auditSetting = new Setting(containerEl)
       .setName("检测未管理项目")
-      .setDesc("只读扫描整个 Vault；确认后才为缺少 GUID 的文件和文件夹生成身份。插件运行期间复制或新建的项目通常已被实时自动纳入。")
+      .setDesc("只读扫描整个 Vault，确认后为未纳入管理的项目生成 GUID。")
       .addButton((button) => button.setButtonText("检测并纳入管理").onClick(() => void this.plugin.auditAndOfferManagement()));
-    new Setting(containerEl)
+    this.addDetails(auditSetting, "检测未管理项目", [
+      "扫描本身只读，不会修改任何文件；只有确认后才会为缺少 GUID 的文件和文件夹生成 GUID。",
+      "插件运行期间复制或新建的项目通常已被实时自动纳入，因此扫描结果可能为零。",
+    ]);
+    const manageSetting = new Setting(containerEl)
       .setName("将当前库中的文件或文件夹纳入本插件管理")
-      .setDesc("为指定文件或文件夹（包含文件夹本身和文件夹下的内容）生成缺失 GUID，或重新生成GUID并建立排序索引，修改后不改变原位置。该功能也可用作重置排序索引。")
+      .setDesc("为选中的项目补齐或重新生成 GUID。")
       .addButton((button) => button.setButtonText("选择文件和文件夹").onClick(() => this.plugin.openIdentitySelection()));
-    new Setting(containerEl)
+    this.addDetails(manageSetting, "将当前库中的文件或文件夹纳入本插件管理", [
+      "范围包含所选文件夹本身以及文件夹下的全部内容。",
+      "可只生成缺失的 GUID，也可重新生成选中项目的 GUID 并建立排序索引；修改后不改变原位置。",
+      "该功能也可用作重置排序索引。",
+    ]);
+    const transferSetting = new Setting(containerEl)
       .setName("跨Vault合并（自动复制）")
-      .setDesc("选择源库和当前库中的目标目录，预检同名冲突；支持整项替换、重命名和编号。每次操作会在插件目录生成 local-copy-* 备份与记录文件夹。确认复制结果、排序都正常，且不再需要恢复记录后，可以删除对应的 local-copy-* 文件夹（例如 local-copy-DJKYhp）；不要删除插件目录中正在使用的 data.json。")
+      .setDesc("从另一个 Vault 或目录复制文件与顺序，冲突可替换、重命名或编号。")
       .addButton(button => button.setButtonText("跨Vault合并（自动复制）").onClick(() => this.plugin.openLocalCopy()));
-    new Setting(containerEl)
+    this.addDetails(transferSetting, "跨Vault合并（自动复制）", [
+      "选择源库和当前库中的目标目录，预检同名冲突后再执行；支持整项替换、重命名和编号。",
+      "每次操作会在插件目录生成 local-copy-* 备份与记录文件夹。",
+      "确认复制结果和排序都正常、且不再需要恢复记录后，可以删除对应的 local-copy-* 文件夹（例如 local-copy-DJKYhp）；不要删除插件目录中正在使用的 data.json。",
+    ]);
+    const legacySetting = new Setting(containerEl)
       .setName("接管历史 Obsidian Vault")
-      .setDesc("用于没有 GUID、没有插件 data.json 的旧库：补全缺失身份与目录索引，并按当前显示结构重建顺序；不移动或重命名文件。")
+      .setDesc("为没有 GUID 的旧库补齐 GUID 并重建目录索引。")
       .addButton((button) => button.setButtonText("检查并接管历史库").onClick(() => void this.plugin.takeOverHistoricalVault()));
-    new Setting(containerEl)
+    this.addDetails(legacySetting, "接管历史 Obsidian Vault", [
+      "适用于没有 GUID、没有插件 data.json 的旧库。",
+      "补全缺失的 GUID 与目录索引，并按当前显示结构重建顺序；不移动或重命名文件。",
+    ]);
+    const mergeSetting = new Setting(containerEl)
       .setName("合并展示配对文件夹笔记")
-      .setDesc("仅匹配位于同名文件夹内、且 f-/d- GUID 后缀相同的 Markdown。名称旁的 ↗ 表示已合并，点击标题打开文档。")
+      .setDesc("把配对的文件夹笔记合并到一行显示。")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
         this.plugin.data.settings.mergePairedFolderNotes = value;
         await this.plugin.saveSettings();
         this.plugin.refreshExplorer();
       }));
+    this.addDetails(mergeSetting, "合并展示配对文件夹笔记", [
+      "仅匹配位于同名文件夹内、且 f-/d- GUID 后缀相同的 Markdown。",
+      "名称旁的 ↗ 表示已合并，点击标题打开文档。",
+    ]);
     new Setting(containerEl)
       .setName("重复 GUID")
       .setDesc("按完整 GUID 检测；修复时保留当前顺序中的首项。")
       .addButton((button) => button.setButtonText("检测并修复").onClick(() => void this.plugin.checkDuplicateGuids(true)));
     new Setting(containerEl)
       .setName("全库更换 GUID")
-      .setDesc("为全部文件和文件夹换号，创建恢复点并保持目录顺序。")
+      .setDesc("为全部文件和文件夹换号，可选择是否创建恢复点。")
       .addButton((button) => button.setButtonText("不备份").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false)))
       .addButton((button) => button.setButtonText("更换并备份").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
     if (this.plugin.data.guidBackups.length) {

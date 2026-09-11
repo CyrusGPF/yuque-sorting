@@ -22,7 +22,7 @@ export function parseVaultTransfer(value: unknown): VaultTransfer {
   for (const item of v.items) {
     if (!item || !safeTransferPath(item.path) || !["file", "folder"].includes(item.kind)
       || typeof item.guid !== "string" || !/^[A-Za-z0-9:_-]+$/.test(item.guid) || item.guid.length > 256
-      || ["__proto__", "constructor", "prototype"].includes(item.guid)) throw new Error("顺序包包含无效路径或身份");
+      || ["__proto__", "constructor", "prototype"].includes(item.guid)) throw new Error("顺序包包含无效路径或 GUID");
     if (paths.has(item.path)) throw new Error(`来源存在重复路径：${item.path}`);
     paths.set(item.path, item);
   }

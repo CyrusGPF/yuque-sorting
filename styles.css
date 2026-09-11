@@ -134,3 +134,176 @@
 .yq-copy-modal .setting-item-control { width: 100%; flex-wrap: wrap; }
 .yq-copy-modal input[type="text"] { flex: 1; min-width: 180px; }
 .yq-copy-modal button { flex-shrink: 0; }
+/* 恢复原语雀目录顺序：结构化确认窗口 */
+.yq-manifest-restore {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  max-width: 620px;
+  font-size: var(--font-ui-small);
+}
+
+.yq-manifest-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 8px;
+}
+
+.yq-manifest-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.yq-manifest-stat-label {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.yq-manifest-stat-value {
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.yq-manifest-stat.is-ok .yq-manifest-stat-value { color: var(--text-success); }
+.yq-manifest-stat.is-warn .yq-manifest-stat-value { color: var(--text-warning); }
+
+.yq-manifest-status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+}
+
+.yq-manifest-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.yq-manifest-section > h4 {
+  margin: 0;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.02em;
+}
+
+.yq-manifest-section.is-problems > h4 { color: var(--text-warning); }
+
+.yq-manifest-preview,
+.yq-manifest-problems,
+.yq-manifest-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.yq-manifest-preview > li {
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.yq-manifest-folder {
+  margin-bottom: 5px;
+  font-weight: var(--font-semibold);
+  overflow-wrap: anywhere;
+}
+
+.yq-manifest-order {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.yq-manifest-order + .yq-manifest-order { margin-top: 3px; }
+.yq-manifest-order.is-next { color: var(--text-normal); }
+
+.yq-manifest-tag {
+  flex: 0 0 auto;
+  min-width: 44px;
+  padding: 0 6px;
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}
+
+.yq-manifest-order.is-next .yq-manifest-tag {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.yq-manifest-problems {
+  max-height: min(30vh, 260px);
+  overflow: auto;
+}
+
+.yq-manifest-problems > li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--text-warning);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.yq-manifest-path {
+  flex: 1 1 100%;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
+.yq-manifest-reason {
+  color: var(--text-warning);
+  font-size: var(--font-ui-smaller);
+}
+
+.yq-manifest-more,
+.yq-manifest-hint {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.yq-manifest-notes {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.6;
+}
+
+.yq-manifest-notes > li { position: relative; padding-left: 14px; }
+.yq-setting-details { max-width: 640px; }
+.yq-setting-details p {
+  margin: 0 0 10px;
+  color: var(--text-normal);
+  line-height: 1.6;
+}
+.yq-setting-details p:last-child { margin-bottom: 0; }
+
+.yq-manifest-notes > li::before {
+  content: "•";
+  position: absolute;
+  left: 2px;
+  color: var(--text-faint);
+}

@@ -314,6 +314,27 @@ test("Yuque manifest order is applied only through explicit manual entry points"
   assert.match(modifyRegistration[0], /if \(this\.ownsAutoCopyPath\(file.path\)\) this.autoCopyLastEvent = Date.now\(\)/);
   assert.doesNotMatch(modifyRegistration[0], /Manifest|read\(|orderByFolder/);
   assert.doesNotMatch(source, /autoSeedFromManifest/);
+  // 设置页只放一句简介，完整说明（含"按路径匹配"的局限）放在可展开的详细说明里。
+  const restoreStart = source.indexOf('.setName("恢复原语雀目录顺序")');
+  assert.notEqual(restoreStart, -1);
+  const restoreBlock = source.slice(restoreStart, source.indexOf("new Setting(containerEl)", restoreStart));
+  assert.match(restoreBlock, /setDesc\("按语雀导出清单恢复目录顺序/);
+  assert.match(restoreBlock, /this\.addDetails\(restoreSetting/);
+  assert.match(restoreBlock, /匹配只看清单中的路径/);
+  assert.match(restoreBlock, /已改名或移动过的项目无法恢复原顺序/);
+  assert.match(restoreBlock, /同一路径若已换成另一个文件/);
+  assert.match(restoreBlock, /只有点此按钮或命令才会执行，启动时绝不自动应用/);
+  // 详细说明必须真的可以打开，而不是只写了文字。
+  assert.match(source, /class SettingDetailsModal extends Modal/);
+  assert.match(source, /setIcon\("help"\)/);
+  assert.match(source, /setTooltip\("查看详细说明"\)/);
+  assert.match(source, /new SettingDetailsModal\(this\.app, title, paragraphs\)\.open\(\)/);
+  // 设置页只显示一句话简介：任何 setDesc 都不能再变成一段长文。
+  const settingDescs = [...source.matchAll(/\.setDesc\("([^"]*)"\)/g)].map(match => match[1]);
+  assert.ok(settingDescs.length >= 10, "expected the settings tab to keep its descriptions");
+  assert.deepEqual(settingDescs.filter(text => text.length > 45), [], "settings page should only show brief summaries");
+  // 用户看不懂"身份"这类内部说法：面向用户的文案一律叫 GUID。
+  assert.doesNotMatch(source, /身份/);
 });
 
 test("identity management uses explicit selection, bounded IO, rollback, and one final save", async () => {
