@@ -2886,6 +2886,9 @@ class YqOrderSettingTab extends PluginSettingTab {
       text: "新文件使用 f- GUID，新文件夹使用独立 d- GUID；顺序保存在插件数据中，不修改文件名。",
     });
 
+    const section = (text: string): void => { new Setting(containerEl).setName(text).setHeading(); };
+
+    section("排序规则");
     new Setting(containerEl)
       .setName("新增项位置")
       .setDesc("新建 Markdown 或文件夹加入当前目录时的位置。")
@@ -2909,13 +2912,21 @@ class YqOrderSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           this.plugin.refreshExplorer();
         }));
-    new Setting(containerEl)
-      .setName("增删后立即持久化")
-      .setDesc("关闭可减少 Obsidian Sync 冲突；拖拽排序仍会保存。")
+    const persistSetting = new Setting(containerEl)
+      .setName("增删后立即保存顺序")
+      .setDesc("新建、删除或改名后是否立即把顺序写入插件数据。")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.persistOrderOnCreateDelete).onChange(async (value) => {
         this.plugin.data.settings.persistOrderOnCreateDelete = value;
         await this.plugin.saveSettings();
       }));
+    this.addDetails(persistSetting, "增删后立即保存顺序", [
+      "开启（默认）：每次新建、删除、改名或移动后，插件都会把最新的目录顺序写入插件数据 data.json。",
+      "关闭：这些操作只改动内存里的顺序，等下一次必须保存的操作（拖拽排序、更换或修复 GUID、跨 Vault 复制、保存设置）或插件卸载时才一起写入。",
+      "关闭可以减少磁盘写入，降低多设备同步（Obsidian Sync 等）产生冲突的概率；代价是 Obsidian 异常退出时，自上次保存以来的增删改名顺序可能丢失。",
+      "拖拽排序不受这个开关影响，始终立即保存。",
+    ]);
+
+    section("文件树交互");
     const dragSetting = new Setting(containerEl)
       .setName("启用文件树拖拽")
       .setDesc("开启后可在文件树里拖拽调整顺序。")
@@ -2928,21 +2939,20 @@ class YqOrderSettingTab extends PluginSettingTab {
       "拖动过程中会显示插入线和动作提示，松手后立即生效。",
       "刚完成的拖拽可用命令“撤销上一次语雀拖拽”还原。",
     ]);
-    new Setting(containerEl)
-      .setName("GUID 随机位数")
-      .setDesc("新 GUID 的随机后缀长度。")
-      .addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit")
-        .setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
-          this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
-          await this.plugin.saveSettings();
-        }));
-    new Setting(containerEl)
-      .setName("启动时检测重复 GUID")
-      .setDesc("启动时只读检测重复 GUID 并提示。")
-      .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
-        this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
+    const mergeSetting = new Setting(containerEl)
+      .setName("合并展示配对文件夹笔记")
+      .setDesc("把配对的文件夹笔记合并到一行显示。")
+      .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
+        this.plugin.data.settings.mergePairedFolderNotes = value;
         await this.plugin.saveSettings();
+        this.plugin.refreshExplorer();
       }));
+    this.addDetails(mergeSetting, "合并展示配对文件夹笔记", [
+      "仅匹配位于同名文件夹内、且 f-/d- GUID 后缀相同的 Markdown。",
+      "名称旁的 ↗ 表示已合并，点击标题打开文档。",
+    ]);
+
+    section("语雀清单");
     const restoreSetting = new Setting(containerEl)
       .setName("恢复原语雀目录顺序")
       .setDesc("按语雀导出清单恢复目录顺序；只按路径匹配，不改动文件与 GUID。")
@@ -2953,6 +2963,16 @@ class YqOrderSettingTab extends PluginSettingTab {
       "匹配只看清单中的路径，不看文件内容：已改名或移动过的项目无法恢复原顺序（会提示缺失/多出）；同一路径若已换成另一个文件，插件不会识别，会直接按清单位置排序。",
       "不会新建、删除、重命名或移动文件。只有点此按钮或命令才会执行，启动时绝不自动应用。",
     ]);
+
+    section("GUID 管理");
+    new Setting(containerEl)
+      .setName("GUID 随机位数")
+      .setDesc("新 GUID 的随机后缀长度。")
+      .addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit")
+        .setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
+          this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
+          await this.plugin.saveSettings();
+        }));
     const auditSetting = new Setting(containerEl)
       .setName("检测未管理项目")
       .setDesc("只读扫描整个 Vault，确认后为未纳入管理的项目生成 GUID。")
@@ -2970,35 +2990,13 @@ class YqOrderSettingTab extends PluginSettingTab {
       "可只生成缺失的 GUID，也可重新生成选中项目的 GUID 并建立排序索引；修改后不改变原位置。",
       "该功能也可用作重置排序索引。",
     ]);
-    const transferSetting = new Setting(containerEl)
-      .setName("跨Vault合并（自动复制）")
-      .setDesc("从另一个 Vault 或目录复制文件与顺序，冲突可替换、重命名或编号。")
-      .addButton(button => button.setButtonText("跨Vault合并（自动复制）").onClick(() => this.plugin.openLocalCopy()));
-    this.addDetails(transferSetting, "跨Vault合并（自动复制）", [
-      "选择源库和当前库中的目标目录，预检同名冲突后再执行；支持整项替换、重命名和编号。",
-      "每次操作会在插件目录生成 local-copy-* 备份与记录文件夹。",
-      "确认复制结果和排序都正常、且不再需要恢复记录后，可以删除对应的 local-copy-* 文件夹（例如 local-copy-DJKYhp）；不要删除插件目录中正在使用的 data.json。",
-    ]);
-    const legacySetting = new Setting(containerEl)
-      .setName("接管历史 Obsidian Vault")
-      .setDesc("为没有 GUID 的旧库补齐 GUID 并重建目录索引。")
-      .addButton((button) => button.setButtonText("检查并接管历史库").onClick(() => void this.plugin.takeOverHistoricalVault()));
-    this.addDetails(legacySetting, "接管历史 Obsidian Vault", [
-      "适用于没有 GUID、没有插件 data.json 的旧库。",
-      "补全缺失的 GUID 与目录索引，并按当前显示结构重建顺序；不移动或重命名文件。",
-    ]);
-    const mergeSetting = new Setting(containerEl)
-      .setName("合并展示配对文件夹笔记")
-      .setDesc("把配对的文件夹笔记合并到一行显示。")
-      .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
-        this.plugin.data.settings.mergePairedFolderNotes = value;
+    new Setting(containerEl)
+      .setName("启动时检测重复 GUID")
+      .setDesc("启动时只读检测重复 GUID 并提示。")
+      .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
+        this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
         await this.plugin.saveSettings();
-        this.plugin.refreshExplorer();
       }));
-    this.addDetails(mergeSetting, "合并展示配对文件夹笔记", [
-      "仅匹配位于同名文件夹内、且 f-/d- GUID 后缀相同的 Markdown。",
-      "名称旁的 ↗ 表示已合并，点击标题打开文档。",
-    ]);
     new Setting(containerEl)
       .setName("重复 GUID")
       .setDesc("按完整 GUID 检测；修复时保留当前顺序中的首项。")
@@ -3009,11 +3007,30 @@ class YqOrderSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("不备份").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false)))
       .addButton((button) => button.setButtonText("更换并备份").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
     if (this.plugin.data.guidBackups.length) {
-      containerEl.createEl("h3", { text: "GUID 恢复点（最多 3 份）" });
+      containerEl.createEl("h4", { text: "GUID 恢复点（最多 3 份）" });
       [...this.plugin.data.guidBackups].reverse().forEach((backup) => {
         new Setting(containerEl).setName(new Date(backup.createdAt).toLocaleString()).setDesc(`${backup.count} 项，${backup.bits} bit`)
           .addButton((button) => button.setButtonText("恢复").onClick(() => void this.plugin.restoreGuidBackup(backup)));
       });
     }
+
+    section("旧库接管与跨库迁移");
+    const legacySetting = new Setting(containerEl)
+      .setName("接管历史 Obsidian Vault")
+      .setDesc("为没有 GUID 的旧库补齐 GUID 并重建目录索引。")
+      .addButton((button) => button.setButtonText("检查并接管历史库").onClick(() => void this.plugin.takeOverHistoricalVault()));
+    this.addDetails(legacySetting, "接管历史 Obsidian Vault", [
+      "适用于没有 GUID、没有插件 data.json 的旧库。",
+      "补全缺失的 GUID 与目录索引，并按当前显示结构重建顺序；不移动或重命名文件。",
+    ]);
+    const transferSetting = new Setting(containerEl)
+      .setName("跨Vault合并（自动复制）")
+      .setDesc("从另一个 Vault 或目录复制文件与顺序，冲突可替换、重命名或编号。")
+      .addButton(button => button.setButtonText("跨Vault合并（自动复制）").onClick(() => this.plugin.openLocalCopy()));
+    this.addDetails(transferSetting, "跨Vault合并（自动复制）", [
+      "选择源库和当前库中的目标目录，预检同名冲突后再执行；支持整项替换、重命名和编号。",
+      "每次操作会在插件目录生成 local-copy-* 备份与记录文件夹。",
+      "确认复制结果和排序都正常、且不再需要恢复记录后，可以删除对应的 local-copy-* 文件夹（例如 local-copy-DJKYhp）；不要删除插件目录中正在使用的 data.json。",
+    ]);
   }
 }

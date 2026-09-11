@@ -3551,6 +3551,10 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.createEl("p", {
       text: "\u65B0\u6587\u4EF6\u4F7F\u7528 f- GUID\uFF0C\u65B0\u6587\u4EF6\u5939\u4F7F\u7528\u72EC\u7ACB d- GUID\uFF1B\u987A\u5E8F\u4FDD\u5B58\u5728\u63D2\u4EF6\u6570\u636E\u4E2D\uFF0C\u4E0D\u4FEE\u6539\u6587\u4EF6\u540D\u3002"
     });
+    const section = (text) => {
+      new import_obsidian.Setting(containerEl).setName(text).setHeading();
+    };
+    section("\u6392\u5E8F\u89C4\u5219");
     new import_obsidian.Setting(containerEl).setName("\u65B0\u589E\u9879\u4F4D\u7F6E").setDesc("\u65B0\u5EFA Markdown \u6216\u6587\u4EF6\u5939\u52A0\u5165\u5F53\u524D\u76EE\u5F55\u65F6\u7684\u4F4D\u7F6E\u3002").addDropdown((dropdown) => dropdown.addOption("bottom", "\u5E95\u90E8").addOption("top", "\u9876\u90E8").setValue(this.plugin.data.settings.newItemPlacement).onChange(async (value) => {
       this.plugin.data.settings.newItemPlacement = value;
       await this.plugin.saveSettings();
@@ -3560,10 +3564,17 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.saveSettings();
       this.plugin.refreshExplorer();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u589E\u5220\u540E\u7ACB\u5373\u6301\u4E45\u5316").setDesc("\u5173\u95ED\u53EF\u51CF\u5C11 Obsidian Sync \u51B2\u7A81\uFF1B\u62D6\u62FD\u6392\u5E8F\u4ECD\u4F1A\u4FDD\u5B58\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.persistOrderOnCreateDelete).onChange(async (value) => {
+    const persistSetting = new import_obsidian.Setting(containerEl).setName("\u589E\u5220\u540E\u7ACB\u5373\u4FDD\u5B58\u987A\u5E8F").setDesc("\u65B0\u5EFA\u3001\u5220\u9664\u6216\u6539\u540D\u540E\u662F\u5426\u7ACB\u5373\u628A\u987A\u5E8F\u5199\u5165\u63D2\u4EF6\u6570\u636E\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.persistOrderOnCreateDelete).onChange(async (value) => {
       this.plugin.data.settings.persistOrderOnCreateDelete = value;
       await this.plugin.saveSettings();
     }));
+    this.addDetails(persistSetting, "\u589E\u5220\u540E\u7ACB\u5373\u4FDD\u5B58\u987A\u5E8F", [
+      "\u5F00\u542F\uFF08\u9ED8\u8BA4\uFF09\uFF1A\u6BCF\u6B21\u65B0\u5EFA\u3001\u5220\u9664\u3001\u6539\u540D\u6216\u79FB\u52A8\u540E\uFF0C\u63D2\u4EF6\u90FD\u4F1A\u628A\u6700\u65B0\u7684\u76EE\u5F55\u987A\u5E8F\u5199\u5165\u63D2\u4EF6\u6570\u636E data.json\u3002",
+      "\u5173\u95ED\uFF1A\u8FD9\u4E9B\u64CD\u4F5C\u53EA\u6539\u52A8\u5185\u5B58\u91CC\u7684\u987A\u5E8F\uFF0C\u7B49\u4E0B\u4E00\u6B21\u5FC5\u987B\u4FDD\u5B58\u7684\u64CD\u4F5C\uFF08\u62D6\u62FD\u6392\u5E8F\u3001\u66F4\u6362\u6216\u4FEE\u590D GUID\u3001\u8DE8 Vault \u590D\u5236\u3001\u4FDD\u5B58\u8BBE\u7F6E\uFF09\u6216\u63D2\u4EF6\u5378\u8F7D\u65F6\u624D\u4E00\u8D77\u5199\u5165\u3002",
+      "\u5173\u95ED\u53EF\u4EE5\u51CF\u5C11\u78C1\u76D8\u5199\u5165\uFF0C\u964D\u4F4E\u591A\u8BBE\u5907\u540C\u6B65\uFF08Obsidian Sync \u7B49\uFF09\u4EA7\u751F\u51B2\u7A81\u7684\u6982\u7387\uFF1B\u4EE3\u4EF7\u662F Obsidian \u5F02\u5E38\u9000\u51FA\u65F6\uFF0C\u81EA\u4E0A\u6B21\u4FDD\u5B58\u4EE5\u6765\u7684\u589E\u5220\u6539\u540D\u987A\u5E8F\u53EF\u80FD\u4E22\u5931\u3002",
+      "\u62D6\u62FD\u6392\u5E8F\u4E0D\u53D7\u8FD9\u4E2A\u5F00\u5173\u5F71\u54CD\uFF0C\u59CB\u7EC8\u7ACB\u5373\u4FDD\u5B58\u3002"
+    ]);
+    section("\u6587\u4EF6\u6811\u4EA4\u4E92");
     const dragSetting = new import_obsidian.Setting(containerEl).setName("\u542F\u7528\u6587\u4EF6\u6811\u62D6\u62FD").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u6587\u4EF6\u6811\u91CC\u62D6\u62FD\u8C03\u6574\u987A\u5E8F\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.enableDrag).onChange(async (value) => {
       this.plugin.data.settings.enableDrag = value;
       await this.plugin.saveSettings();
@@ -3573,14 +3584,16 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       "\u62D6\u52A8\u8FC7\u7A0B\u4E2D\u4F1A\u663E\u793A\u63D2\u5165\u7EBF\u548C\u52A8\u4F5C\u63D0\u793A\uFF0C\u677E\u624B\u540E\u7ACB\u5373\u751F\u6548\u3002",
       "\u521A\u5B8C\u6210\u7684\u62D6\u62FD\u53EF\u7528\u547D\u4EE4\u201C\u64A4\u9500\u4E0A\u4E00\u6B21\u8BED\u96C0\u62D6\u62FD\u201D\u8FD8\u539F\u3002"
     ]);
-    new import_obsidian.Setting(containerEl).setName("GUID \u968F\u673A\u4F4D\u6570").setDesc("\u65B0 GUID \u7684\u968F\u673A\u540E\u7F00\u957F\u5EA6\u3002").addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit").setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
-      this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
+    const mergeSetting = new import_obsidian.Setting(containerEl).setName("\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0").setDesc("\u628A\u914D\u5BF9\u7684\u6587\u4EF6\u5939\u7B14\u8BB0\u5408\u5E76\u5230\u4E00\u884C\u663E\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
+      this.plugin.data.settings.mergePairedFolderNotes = value;
       await this.plugin.saveSettings();
+      this.plugin.refreshExplorer();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u542F\u52A8\u65F6\u68C0\u6D4B\u91CD\u590D GUID").setDesc("\u542F\u52A8\u65F6\u53EA\u8BFB\u68C0\u6D4B\u91CD\u590D GUID \u5E76\u63D0\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
-      this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
-      await this.plugin.saveSettings();
-    }));
+    this.addDetails(mergeSetting, "\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0", [
+      "\u4EC5\u5339\u914D\u4F4D\u4E8E\u540C\u540D\u6587\u4EF6\u5939\u5185\u3001\u4E14 f-/d- GUID \u540E\u7F00\u76F8\u540C\u7684 Markdown\u3002",
+      "\u540D\u79F0\u65C1\u7684 \u2197 \u8868\u793A\u5DF2\u5408\u5E76\uFF0C\u70B9\u51FB\u6807\u9898\u6253\u5F00\u6587\u6863\u3002"
+    ]);
+    section("\u8BED\u96C0\u6E05\u5355");
     const restoreSetting = new import_obsidian.Setting(containerEl).setName("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").setDesc("\u6309\u8BED\u96C0\u5BFC\u51FA\u6E05\u5355\u6062\u590D\u76EE\u5F55\u987A\u5E8F\uFF1B\u53EA\u6309\u8DEF\u5F84\u5339\u914D\uFF0C\u4E0D\u6539\u52A8\u6587\u4EF6\u4E0E GUID\u3002").addButton((button) => button.setButtonText("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").onClick(() => void this.plugin.requestManifestImport()));
     this.addDetails(restoreSetting, "\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F", [
       "\u8BFB\u53D6\u5E93\u91CC\u7684 _yuque_order.json\uFF08\u8BED\u96C0\u5BFC\u51FA\u6E05\u5355\uFF09\uFF0C\u628A\u5404\u76EE\u5F55\u7684\u663E\u793A\u987A\u5E8F\u8C03\u56DE\u8BED\u96C0\u91CC\u7684\u539F\u987A\u5E8F\u3002",
@@ -3588,6 +3601,11 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       "\u5339\u914D\u53EA\u770B\u6E05\u5355\u4E2D\u7684\u8DEF\u5F84\uFF0C\u4E0D\u770B\u6587\u4EF6\u5185\u5BB9\uFF1A\u5DF2\u6539\u540D\u6216\u79FB\u52A8\u8FC7\u7684\u9879\u76EE\u65E0\u6CD5\u6062\u590D\u539F\u987A\u5E8F\uFF08\u4F1A\u63D0\u793A\u7F3A\u5931/\u591A\u51FA\uFF09\uFF1B\u540C\u4E00\u8DEF\u5F84\u82E5\u5DF2\u6362\u6210\u53E6\u4E00\u4E2A\u6587\u4EF6\uFF0C\u63D2\u4EF6\u4E0D\u4F1A\u8BC6\u522B\uFF0C\u4F1A\u76F4\u63A5\u6309\u6E05\u5355\u4F4D\u7F6E\u6392\u5E8F\u3002",
       "\u4E0D\u4F1A\u65B0\u5EFA\u3001\u5220\u9664\u3001\u91CD\u547D\u540D\u6216\u79FB\u52A8\u6587\u4EF6\u3002\u53EA\u6709\u70B9\u6B64\u6309\u94AE\u6216\u547D\u4EE4\u624D\u4F1A\u6267\u884C\uFF0C\u542F\u52A8\u65F6\u7EDD\u4E0D\u81EA\u52A8\u5E94\u7528\u3002"
     ]);
+    section("GUID \u7BA1\u7406");
+    new import_obsidian.Setting(containerEl).setName("GUID \u968F\u673A\u4F4D\u6570").setDesc("\u65B0 GUID \u7684\u968F\u673A\u540E\u7F00\u957F\u5EA6\u3002").addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit").setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
+      this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
+      await this.plugin.saveSettings();
+    }));
     const auditSetting = new import_obsidian.Setting(containerEl).setName("\u68C0\u6D4B\u672A\u7BA1\u7406\u9879\u76EE").setDesc("\u53EA\u8BFB\u626B\u63CF\u6574\u4E2A Vault\uFF0C\u786E\u8BA4\u540E\u4E3A\u672A\u7EB3\u5165\u7BA1\u7406\u7684\u9879\u76EE\u751F\u6210 GUID\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u7EB3\u5165\u7BA1\u7406").onClick(() => void this.plugin.auditAndOfferManagement()));
     this.addDetails(auditSetting, "\u68C0\u6D4B\u672A\u7BA1\u7406\u9879\u76EE", [
       "\u626B\u63CF\u672C\u8EAB\u53EA\u8BFB\uFF0C\u4E0D\u4F1A\u4FEE\u6539\u4EFB\u4F55\u6587\u4EF6\uFF1B\u53EA\u6709\u786E\u8BA4\u540E\u624D\u4F1A\u4E3A\u7F3A\u5C11 GUID \u7684\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u751F\u6210 GUID\u3002",
@@ -3599,33 +3617,29 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       "\u53EF\u53EA\u751F\u6210\u7F3A\u5931\u7684 GUID\uFF0C\u4E5F\u53EF\u91CD\u65B0\u751F\u6210\u9009\u4E2D\u9879\u76EE\u7684 GUID \u5E76\u5EFA\u7ACB\u6392\u5E8F\u7D22\u5F15\uFF1B\u4FEE\u6539\u540E\u4E0D\u6539\u53D8\u539F\u4F4D\u7F6E\u3002",
       "\u8BE5\u529F\u80FD\u4E5F\u53EF\u7528\u4F5C\u91CD\u7F6E\u6392\u5E8F\u7D22\u5F15\u3002"
     ]);
+    new import_obsidian.Setting(containerEl).setName("\u542F\u52A8\u65F6\u68C0\u6D4B\u91CD\u590D GUID").setDesc("\u542F\u52A8\u65F6\u53EA\u8BFB\u68C0\u6D4B\u91CD\u590D GUID \u5E76\u63D0\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
+      this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u91CD\u590D GUID").setDesc("\u6309\u5B8C\u6574 GUID \u68C0\u6D4B\uFF1B\u4FEE\u590D\u65F6\u4FDD\u7559\u5F53\u524D\u987A\u5E8F\u4E2D\u7684\u9996\u9879\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u4FEE\u590D").onClick(() => void this.plugin.checkDuplicateGuids(true)));
+    new import_obsidian.Setting(containerEl).setName("\u5168\u5E93\u66F4\u6362 GUID").setDesc("\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u6362\u53F7\uFF0C\u53EF\u9009\u62E9\u662F\u5426\u521B\u5EFA\u6062\u590D\u70B9\u3002").addButton((button) => button.setButtonText("\u4E0D\u5907\u4EFD").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false))).addButton((button) => button.setButtonText("\u66F4\u6362\u5E76\u5907\u4EFD").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
+    if (this.plugin.data.guidBackups.length) {
+      containerEl.createEl("h4", { text: "GUID \u6062\u590D\u70B9\uFF08\u6700\u591A 3 \u4EFD\uFF09" });
+      [...this.plugin.data.guidBackups].reverse().forEach((backup) => {
+        new import_obsidian.Setting(containerEl).setName(new Date(backup.createdAt).toLocaleString()).setDesc(`${backup.count} \u9879\uFF0C${backup.bits} bit`).addButton((button) => button.setButtonText("\u6062\u590D").onClick(() => void this.plugin.restoreGuidBackup(backup)));
+      });
+    }
+    section("\u65E7\u5E93\u63A5\u7BA1\u4E0E\u8DE8\u5E93\u8FC1\u79FB");
+    const legacySetting = new import_obsidian.Setting(containerEl).setName("\u63A5\u7BA1\u5386\u53F2 Obsidian Vault").setDesc("\u4E3A\u6CA1\u6709 GUID \u7684\u65E7\u5E93\u8865\u9F50 GUID \u5E76\u91CD\u5EFA\u76EE\u5F55\u7D22\u5F15\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u63A5\u7BA1\u5386\u53F2\u5E93").onClick(() => void this.plugin.takeOverHistoricalVault()));
+    this.addDetails(legacySetting, "\u63A5\u7BA1\u5386\u53F2 Obsidian Vault", [
+      "\u9002\u7528\u4E8E\u6CA1\u6709 GUID\u3001\u6CA1\u6709\u63D2\u4EF6 data.json \u7684\u65E7\u5E93\u3002",
+      "\u8865\u5168\u7F3A\u5931\u7684 GUID \u4E0E\u76EE\u5F55\u7D22\u5F15\uFF0C\u5E76\u6309\u5F53\u524D\u663E\u793A\u7ED3\u6784\u91CD\u5EFA\u987A\u5E8F\uFF1B\u4E0D\u79FB\u52A8\u6216\u91CD\u547D\u540D\u6587\u4EF6\u3002"
+    ]);
     const transferSetting = new import_obsidian.Setting(containerEl).setName("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").setDesc("\u4ECE\u53E6\u4E00\u4E2A Vault \u6216\u76EE\u5F55\u590D\u5236\u6587\u4EF6\u4E0E\u987A\u5E8F\uFF0C\u51B2\u7A81\u53EF\u66FF\u6362\u3001\u91CD\u547D\u540D\u6216\u7F16\u53F7\u3002").addButton((button) => button.setButtonText("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").onClick(() => this.plugin.openLocalCopy()));
     this.addDetails(transferSetting, "\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09", [
       "\u9009\u62E9\u6E90\u5E93\u548C\u5F53\u524D\u5E93\u4E2D\u7684\u76EE\u6807\u76EE\u5F55\uFF0C\u9884\u68C0\u540C\u540D\u51B2\u7A81\u540E\u518D\u6267\u884C\uFF1B\u652F\u6301\u6574\u9879\u66FF\u6362\u3001\u91CD\u547D\u540D\u548C\u7F16\u53F7\u3002",
       "\u6BCF\u6B21\u64CD\u4F5C\u4F1A\u5728\u63D2\u4EF6\u76EE\u5F55\u751F\u6210 local-copy-* \u5907\u4EFD\u4E0E\u8BB0\u5F55\u6587\u4EF6\u5939\u3002",
       "\u786E\u8BA4\u590D\u5236\u7ED3\u679C\u548C\u6392\u5E8F\u90FD\u6B63\u5E38\u3001\u4E14\u4E0D\u518D\u9700\u8981\u6062\u590D\u8BB0\u5F55\u540E\uFF0C\u53EF\u4EE5\u5220\u9664\u5BF9\u5E94\u7684 local-copy-* \u6587\u4EF6\u5939\uFF08\u4F8B\u5982 local-copy-DJKYhp\uFF09\uFF1B\u4E0D\u8981\u5220\u9664\u63D2\u4EF6\u76EE\u5F55\u4E2D\u6B63\u5728\u4F7F\u7528\u7684 data.json\u3002"
     ]);
-    const legacySetting = new import_obsidian.Setting(containerEl).setName("\u63A5\u7BA1\u5386\u53F2 Obsidian Vault").setDesc("\u4E3A\u6CA1\u6709 GUID \u7684\u65E7\u5E93\u8865\u9F50 GUID \u5E76\u91CD\u5EFA\u76EE\u5F55\u7D22\u5F15\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u63A5\u7BA1\u5386\u53F2\u5E93").onClick(() => void this.plugin.takeOverHistoricalVault()));
-    this.addDetails(legacySetting, "\u63A5\u7BA1\u5386\u53F2 Obsidian Vault", [
-      "\u9002\u7528\u4E8E\u6CA1\u6709 GUID\u3001\u6CA1\u6709\u63D2\u4EF6 data.json \u7684\u65E7\u5E93\u3002",
-      "\u8865\u5168\u7F3A\u5931\u7684 GUID \u4E0E\u76EE\u5F55\u7D22\u5F15\uFF0C\u5E76\u6309\u5F53\u524D\u663E\u793A\u7ED3\u6784\u91CD\u5EFA\u987A\u5E8F\uFF1B\u4E0D\u79FB\u52A8\u6216\u91CD\u547D\u540D\u6587\u4EF6\u3002"
-    ]);
-    const mergeSetting = new import_obsidian.Setting(containerEl).setName("\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0").setDesc("\u628A\u914D\u5BF9\u7684\u6587\u4EF6\u5939\u7B14\u8BB0\u5408\u5E76\u5230\u4E00\u884C\u663E\u793A\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
-      this.plugin.data.settings.mergePairedFolderNotes = value;
-      await this.plugin.saveSettings();
-      this.plugin.refreshExplorer();
-    }));
-    this.addDetails(mergeSetting, "\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0", [
-      "\u4EC5\u5339\u914D\u4F4D\u4E8E\u540C\u540D\u6587\u4EF6\u5939\u5185\u3001\u4E14 f-/d- GUID \u540E\u7F00\u76F8\u540C\u7684 Markdown\u3002",
-      "\u540D\u79F0\u65C1\u7684 \u2197 \u8868\u793A\u5DF2\u5408\u5E76\uFF0C\u70B9\u51FB\u6807\u9898\u6253\u5F00\u6587\u6863\u3002"
-    ]);
-    new import_obsidian.Setting(containerEl).setName("\u91CD\u590D GUID").setDesc("\u6309\u5B8C\u6574 GUID \u68C0\u6D4B\uFF1B\u4FEE\u590D\u65F6\u4FDD\u7559\u5F53\u524D\u987A\u5E8F\u4E2D\u7684\u9996\u9879\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u4FEE\u590D").onClick(() => void this.plugin.checkDuplicateGuids(true)));
-    new import_obsidian.Setting(containerEl).setName("\u5168\u5E93\u66F4\u6362 GUID").setDesc("\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u6362\u53F7\uFF0C\u53EF\u9009\u62E9\u662F\u5426\u521B\u5EFA\u6062\u590D\u70B9\u3002").addButton((button) => button.setButtonText("\u4E0D\u5907\u4EFD").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false))).addButton((button) => button.setButtonText("\u66F4\u6362\u5E76\u5907\u4EFD").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
-    if (this.plugin.data.guidBackups.length) {
-      containerEl.createEl("h3", { text: "GUID \u6062\u590D\u70B9\uFF08\u6700\u591A 3 \u4EFD\uFF09" });
-      [...this.plugin.data.guidBackups].reverse().forEach((backup) => {
-        new import_obsidian.Setting(containerEl).setName(new Date(backup.createdAt).toLocaleString()).setDesc(`${backup.count} \u9879\uFF0C${backup.bits} bit`).addButton((button) => button.setButtonText("\u6062\u590D").onClick(() => void this.plugin.restoreGuidBackup(backup)));
-      });
-    }
   }
 };

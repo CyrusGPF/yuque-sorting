@@ -335,6 +335,18 @@ test("Yuque manifest order is applied only through explicit manual entry points"
   assert.deepEqual(settingDescs.filter(text => text.length > 45), [], "settings page should only show brief summaries");
   // 用户看不懂"身份"这类内部说法：面向用户的文案一律叫 GUID。
   assert.doesNotMatch(source, /身份/);
+  // "增删后立即保存顺序"这类开关必须讲清开启/关闭的差别和代价。
+  const persistStart = source.indexOf('.setName("增删后立即保存顺序")');
+  assert.notEqual(persistStart, -1);
+  const persistBlock = source.slice(persistStart, source.indexOf("new Setting(containerEl)", persistStart));
+  assert.match(persistBlock, /setDesc\("新建、删除或改名后是否立即把顺序写入插件数据。"\)/);
+  assert.match(persistBlock, /this\.addDetails\(persistSetting/);
+  assert.match(persistBlock, /只改动内存里的顺序/);
+  assert.match(persistBlock, /拖拽排序不受这个开关影响/);
+  // 设置页按功能分区并保持固定顺序，避免又变回一长串平铺设置。
+  assert.match(source, /setName\(text\)\.setHeading\(\)/);
+  const sectionTitles = [...source.matchAll(/section\("([^"]+)"\);/g)].map(match => match[1]);
+  assert.deepEqual(sectionTitles, ["排序规则", "文件树交互", "语雀清单", "GUID 管理", "旧库接管与跨库迁移"]);
 });
 
 test("identity management uses explicit selection, bounded IO, rollback, and one final save", async () => {
