@@ -46,6 +46,68 @@ export function sanitizePortableName(name: string): string {
   return result;
 }
 
+/**
+ * Extract local file references from Markdown and return vault-relative paths.
+ * The result also contains every parent directory up to scopeRoot so legacy
+ * manifests can treat exported attachment trees as declared resources.
+ */
+export function referencedLocalPaths(markdown: string, notePath: string, scopeRoot: string): Set<string> {
+  const result = new Set<string>();
+  const normalizedRoot = scopeRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const noteParent = notePath.replace(/\\/g, "/").split("/").slice(0, -1);
+
+  const add = (rawTarget: string): void => {
+    let target = String(rawTarget || "").trim().replace(/^<|>$/g, "");
+    if (!target || /^(?:[a-z][a-z0-9+.-]*:|#)/i.test(target)) return;
+    target = target.split(/[?#]/, 1)[0];
+    try { target = decodeURIComponent(target); } catch { /* keep malformed paths literal */ }
+    target = target.replace(/\\/g, "/");
+    const parts = target.startsWith("/") ? [] : [...noteParent];
+    for (const part of target.replace(/^\/+/, "").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") parts.pop(); else parts.push(part);
+    }
+    const resolved = parts.join("/");
+    if (!resolved || (normalizedRoot && resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}/`))) return;
+    result.add(resolved);
+    let parent = resolved.split("/").slice(0, -1).join("/");
+    while (parent && parent !== normalizedRoot && (!normalizedRoot || parent.startsWith(`${normalizedRoot}/`))) {
+      result.add(parent);
+      parent = parent.split("/").slice(0, -1).join("/");
+    }
+  };
+
+  const scan = (pattern: RegExp): void => {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(markdown)) !== null) add(match[1]);
+  };
+  // Markdown destinations may legally contain balanced parentheses. A small
+  // scanner avoids truncating names such as attachment/会话控制(原)-1.png.
+  let cursor = 0;
+  while ((cursor = markdown.indexOf("](", cursor)) >= 0) {
+    const start = cursor + 2;
+    let depth = 1;
+    let escaped = false;
+    let end = start;
+    for (; end < markdown.length; end += 1) {
+      const char = markdown[end];
+      if (escaped) { escaped = false; continue; }
+      if (char === "\\") { escaped = true; continue; }
+      if (char === "(") depth += 1;
+      else if (char === ")" && --depth === 0) break;
+      if (char === "\n" || char === "\r") break;
+    }
+    if (depth === 0) {
+      const destination = markdown.slice(start, end).trim();
+      add(destination.startsWith("<") ? destination.split(">", 1)[0] + ">" : destination.split(/\s+["']/)[0]);
+    }
+    cursor = Math.max(end + 1, start);
+  }
+  scan(/!?\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g);
+  scan(/(?:src|href)\s*=\s*["']([^"']+)["']/gi);
+  return result;
+}
+
 export function normalizeGuid(value: unknown): string | null {
   if (typeof value !== "string" && typeof value !== "number") return null;
   const guid = String(value).trim();

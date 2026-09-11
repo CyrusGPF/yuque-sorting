@@ -1,11 +1,12 @@
 {
-  "name": "yuque-order-drag",
-  "version": "0.2.1",
+  "name": "yuque-sorting",
+  "version": "0.3.9",
   "private": true,
   "type": "module",
-  "description": "Obsidian Yuque Order Drag V1 plugin",
+  "description": "Obsidian Yuque Sorting plugin",
   "scripts": {
     "build": "node build.mjs",
+    "pack": "npm run build",
     "dev": "node build.mjs --watch",
     "test": "node --experimental-strip-types --test test/*.test.mjs"
   },

@@ -15,6 +15,7 @@ import {
   relocateGuid,
   removeGuidFromOrders,
   replaceGuidInOrders,
+  referencedLocalPaths,
   restoreGuidOrderPosition,
   sanitizePortableName,
   sortEntries,
@@ -28,6 +29,21 @@ test("drag targeting exposes precise before, inside, and after zones", () => {
   assert.equal(dropPositionForPointer(120, 100, 20, true), "after");
   assert.equal(dropPositionForPointer(109, 100, 20, false), "before");
   assert.equal(dropPositionForPointer(111, 100, 20, false), "after");
+});
+
+test("legacy manifest resource discovery resolves local links inside its own knowledge-base root", () => {
+  const markdown = [
+    "![image](../attachment/a%20b.png)",
+    "![parentheses](../attachment/会话控制(原)-1.png)",
+    "[[../attachment/manual.pdf|manual]]",
+    '<img src="assets/board.svg">',
+    "[remote](https://example.com/a.png)",
+    "![outside](../../other/secret.png)",
+  ].join("\n");
+  assert.deepEqual(
+    [...referencedLocalPaths(markdown, "前端/章节/文档.md", "前端")].sort(),
+    ["前端/attachment", "前端/attachment/a b.png", "前端/attachment/会话控制(原)-1.png", "前端/attachment/manual.pdf", "前端/章节", "前端/章节/assets", "前端/章节/assets/board.svg"].sort(),
+  );
 });
 
 test("drag move validation rejects self, descendants, and name conflicts", () => {
@@ -280,18 +296,64 @@ test("non-Markdown identities survive file and ancestor-folder moves", () => {
   });
 });
 
-test("Yuque manifest import has exactly one explicit manual call site", async () => {
+test("Yuque manifest order is applied only through explicit manual entry points", async () => {
   const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
-  assert.equal((source.match(/await this\.seedFromManifests\(\)/g) || []).length, 1);
-  assert.match(source, /async requestManifestImport\(\)/);
-  assert.doesNotMatch(source, /vault\.on\("modify"/);
+  assert.match(source, /async requestManifestImport\(\): Promise<void>/);
+  assert.match(source, /id: "restore-yuque-order-manifest"/);
+  assert.match(source, /name: "恢复原语雀目录顺序"/);
+  assert.doesNotMatch(source, /id: "import-yuque-order-manifest"/);
+  assert.match(source, /const expectedParent = directory\.path \? normalizePath\(directory\.path\) : ""/);
+  assert.match(source, /markdownTextByPath\.set\(path, text\)/);
+  assert.match(source, /Array\.isArray\(raw\.resources\)/);
+  assert.match(source, /referencedLocalPaths\(text, path, root\)/);
+  assert.match(source, /清单中存在重复最终路径/);
+  assert.match(source, /consumedManifestIds\.includes\(raw\.exportId\)/);
+  // The copy transaction observes modification timing only; it must never read/apply a manifest.
+  const modifyRegistration = source.split("\n").filter(line => line.includes('vault.on("modify"'));
+  assert.equal(modifyRegistration.length, 1);
+  assert.match(modifyRegistration[0], /if \(this\.ownsAutoCopyPath\(file.path\)\) this.autoCopyLastEvent = Date.now\(\)/);
+  assert.doesNotMatch(modifyRegistration[0], /Manifest|read\(|orderByFolder/);
   assert.doesNotMatch(source, /autoSeedFromManifest/);
+});
+
+test("identity management uses explicit selection, bounded IO, rollback, and one final save", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  const start = source.indexOf("private async applyIdentitySelection");
+  const end = source.indexOf("async checkDuplicateGuids", start);
+  const body = source.slice(start, end);
+  assert.notEqual(start, -1);
+  assert.match(body, /mapLimit\(mutations, 4/);
+  assert.match(body, /replaceGuidInOrders/);
+  assert.match(body, /clearFileGuid/);
+  assert.match(body, /await this\.forceSave\(\)/);
+});
+
+test("paired folder-note display is DOM-only and leaves sorted items authoritative", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../styles.css", import.meta.url), "utf8");
+  assert.match(source, /applyFolderNoteDisplay/);
+  assert.match(source, /yq-order-folder-note-hidden/);
+  assert.match(source, /workspace\.on\("file-menu"/);
+  assert.match(source, /data-yq-merged-label/);
+  assert.match(styles, /content: attr\(data-yq-merged-label\)/);
+  assert.match(styles, /合并文档|yq-order-folder-note/);
+  const sortStart = source.indexOf("sortFolderItems(");
+  const sortEnd = source.indexOf("private async handleCreate", sortStart);
+  assert.doesNotMatch(source.slice(sortStart, sortEnd), /filter\(.*shouldHidePairedFolderNote/);
+});
+
+test("historical takeover checks index gaps and rebuilds from one path snapshot", async () => {
+  const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
+  assert.match(source, /const unindexed = this\.collectUnindexedItems\(\)/);
+  assert.match(source, /currentOrder = this\.collectIdentityState\(\)\.folderChildrenByPath/);
+  assert.match(source, /if \(orderSnapshot\) this\.rebuildOrders\(orderSnapshot\)/);
+  assert.match(source, /复制或新建的项目已由插件实时自动纳入/);
 });
 
 test("drop execution defers authoritative order mutation until rename succeeds", async () => {
   const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
   const branchStart = source.indexOf("if (targetFolder) {");
-  const rename = source.indexOf("await this.app.fileManager.renameFile(source as any, destination)", branchStart);
+  const rename = source.indexOf("await this.renameTracked(source, destination)", branchStart);
   assert.notEqual(branchStart, -1);
   assert.notEqual(rename, -1);
   assert.doesNotMatch(source.slice(branchStart, rename), /removeGuidFromOrders|relocateGuid|placeGuidRelative/);
@@ -309,10 +371,11 @@ test("drag cancellation clears only transient UI state", async () => {
   );
 });
 
-test("successful drags expose a guarded undo command and notice action", async () => {
+test("successful drags expose a guarded undo command without a persistent notice action", async () => {
   const source = await readFile(new URL("../main.ts", import.meta.url), "utf8");
   assert.match(source, /id: "undo-last-yuque-drag"/);
-  assert.match(source, /button\.textContent = "撤销"/);
+  assert.match(source, /dragUndoStack\.length > 50/);
+  assert.doesNotMatch(source, /button\.textContent = "撤销"/);
   assert.match(source, /无法撤销：原位置已存在同名项目/);
   assert.match(source, /无法撤销：拖拽创建的文件夹中已有其他项目/);
 });

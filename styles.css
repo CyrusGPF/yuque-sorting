@@ -85,3 +85,52 @@
     transition: none;
   }
 }
+
+.yq-order-folder-note-hidden {
+  display: none !important;
+}
+
+.yq-order-folder-note > .nav-folder-title {
+  cursor: pointer;
+}
+
+.yq-order-folder-note > .nav-folder-title::after {
+  content: attr(data-yq-merged-label);
+  flex: 0 0 auto;
+  margin-inline-start: 4px;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: normal;
+  line-height: 1.35;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.yq-order-selection-search {
+  box-sizing: border-box;
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.yq-order-selection-list {
+  max-height: min(52vh, 520px);
+  margin: 8px 0;
+  padding: 6px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.yq-order-selection-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 2px;
+  overflow-wrap: anywhere;
+}
+.yq-copy-modal .setting-item { flex-wrap: wrap; gap: 8px; }
+.yq-copy-modal .setting-item-info { flex-basis: 100%; }
+.yq-copy-modal .setting-item-control { width: 100%; flex-wrap: wrap; }
+.yq-copy-modal input[type="text"] { flex: 1; min-width: 180px; }
+.yq-copy-modal button { flex-shrink: 0; }

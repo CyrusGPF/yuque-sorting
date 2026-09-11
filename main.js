@@ -9,9 +9,9 @@ var __export = (target, all) => {
 };
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    for (let key2 of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key2) && key2 !== except)
+        __defProp(to, key2, { get: () => from[key2], enumerable: !(desc = __getOwnPropDesc(from, key2)) || desc.enumerable });
   }
   return to;
 };
@@ -42,6 +42,68 @@ function sanitizePortableName(name) {
   if (result.length > 120) {
     result = result.slice(0, 120).replace(/[. ]+$/g, "");
   }
+  return result;
+}
+function referencedLocalPaths(markdown, notePath, scopeRoot) {
+  const result = /* @__PURE__ */ new Set();
+  const normalizedRoot = scopeRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const noteParent = notePath.replace(/\\/g, "/").split("/").slice(0, -1);
+  const add = (rawTarget) => {
+    let target = String(rawTarget || "").trim().replace(/^<|>$/g, "");
+    if (!target || /^(?:[a-z][a-z0-9+.-]*:|#)/i.test(target)) return;
+    target = target.split(/[?#]/, 1)[0];
+    try {
+      target = decodeURIComponent(target);
+    } catch (e) {
+    }
+    target = target.replace(/\\/g, "/");
+    const parts = target.startsWith("/") ? [] : [...noteParent];
+    for (const part of target.replace(/^\/+/, "").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") parts.pop();
+      else parts.push(part);
+    }
+    const resolved = parts.join("/");
+    if (!resolved || normalizedRoot && resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}/`)) return;
+    result.add(resolved);
+    let parent = resolved.split("/").slice(0, -1).join("/");
+    while (parent && parent !== normalizedRoot && (!normalizedRoot || parent.startsWith(`${normalizedRoot}/`))) {
+      result.add(parent);
+      parent = parent.split("/").slice(0, -1).join("/");
+    }
+  };
+  const scan = (pattern) => {
+    let match;
+    while ((match = pattern.exec(markdown)) !== null) add(match[1]);
+  };
+  let cursor = 0;
+  while ((cursor = markdown.indexOf("](", cursor)) >= 0) {
+    const start = cursor + 2;
+    let depth = 1;
+    let escaped = false;
+    let end = start;
+    for (; end < markdown.length; end += 1) {
+      const char = markdown[end];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "(") depth += 1;
+      else if (char === ")" && --depth === 0) break;
+      if (char === "\n" || char === "\r") break;
+    }
+    if (depth === 0) {
+      const destination = markdown.slice(start, end).trim();
+      add(destination.startsWith("<") ? destination.split(">", 1)[0] + ">" : destination.split(/\s+["']/)[0]);
+    }
+    cursor = Math.max(end + 1, start);
+  }
+  scan(/!?\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g);
+  scan(/(?:src|href)\s*=\s*["']([^"']+)["']/gi);
   return result;
 }
 function normalizeGuid(value) {
@@ -165,23 +227,6 @@ function replaceGuidInOrders(orderByFolder, oldGuid, newGuid) {
   }
   return changed;
 }
-function folderIdentityPathForNote(notePath, folderGuids, guid) {
-  const withoutExtension = notePath.replace(/\.md$/i, "");
-  const slash = notePath.lastIndexOf("/");
-  const parent = slash < 0 ? "" : notePath.slice(0, slash);
-  const noteName = withoutExtension.slice(withoutExtension.lastIndexOf("/") + 1);
-  const parentName = parent.slice(parent.lastIndexOf("/") + 1);
-  const candidates = noteName === parentName ? [parent, withoutExtension] : [withoutExtension];
-  return candidates.find((path) => path && folderGuids[path] === guid) || null;
-}
-function detachFolderNoteFromOrder(orderByFolder, folderGuid) {
-  const ownedOrder = orderByFolder[folderGuid];
-  if (!ownedOrder) return false;
-  const next = ownedOrder.filter((guid) => guid !== folderGuid);
-  if (next.length === ownedOrder.length) return false;
-  orderByFolder[folderGuid] = next;
-  return true;
-}
 function migratePathMappings(mappings, oldPath, newPath) {
   const prefix = `${oldPath}/`;
   const updates = [];
@@ -254,14 +299,540 @@ function moveBlockReason(sourcePath, sourceIsFolder, targetFolderPath, destinati
   return destinationExists ? "conflict" : null;
 }
 
+// src/folder-note-utils.ts
+function typedGuidToken(value, expectedKind) {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const guid = String(value).trim();
+  if (!guid || guid[0] !== expectedKind || guid[1] !== "-" && guid[1] !== ":") return null;
+  return guid.slice(2) || null;
+}
+function pairedFolderNoteToken(input) {
+  if (!input.directChild || input.folderName !== input.fileBasename) return null;
+  const folderToken = typedGuidToken(input.folderGuid, "d");
+  const fileToken = typedGuidToken(input.fileGuid, "f");
+  return folderToken && fileToken && folderToken === fileToken ? folderToken : null;
+}
+function mergeChoice(globalEnabled, overrides, token) {
+  return Object.prototype.hasOwnProperty.call(overrides, token) ? overrides[token] : globalEnabled;
+}
+
+// src/guid-utils.ts
+function normalizeGuidBits(value) {
+  return Number(value) === 72 ? 72 : 64;
+}
+var BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+function encodeBase62(bytes, length) {
+  const quotient = Array.from(bytes);
+  const encoded = [];
+  let first = 0;
+  while (first < quotient.length) {
+    let remainder = 0;
+    for (let index = first; index < quotient.length; index += 1) {
+      const value = remainder * 256 + quotient[index];
+      quotient[index] = Math.floor(value / 62);
+      remainder = value % 62;
+    }
+    encoded.push(BASE62[remainder]);
+    while (first < quotient.length && quotient[first] === 0) first += 1;
+  }
+  return encoded.reverse().join("").padStart(length, "0");
+}
+function createTypedGuid(kind, bits = 64, used, random = globalThis.crypto) {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const bytes = new Uint8Array(bits / 8);
+    random.getRandomValues(bytes);
+    const guid = `${kind}-${encodeBase62(bytes, bits === 72 ? 13 : 11)}`;
+    if (!used || !used.has(guid)) {
+      used == null ? void 0 : used.add(guid);
+      return guid;
+    }
+  }
+  throw new Error("\u65E0\u6CD5\u751F\u6210\u552F\u4E00 GUID");
+}
+function findDuplicateIdentities(entries) {
+  const first = /* @__PURE__ */ new Map();
+  const duplicate = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const initial = first.get(entry.guid);
+    if (!initial) {
+      first.set(entry.guid, entry);
+      continue;
+    }
+    const group = duplicate.get(entry.guid);
+    if (group) group.push(entry);
+    else duplicate.set(entry.guid, [initial, entry]);
+  }
+  return [...duplicate.values()];
+}
+function remapOrderSnapshot(folderChildrenByPath, guidByPath, folderGuidByPath) {
+  const result = {};
+  for (const [folderPath, childPaths] of Object.entries(folderChildrenByPath)) {
+    const key2 = folderPath ? folderGuidByPath.get(folderPath) : "__root__";
+    if (!key2) continue;
+    result[key2] = childPaths.map((path) => guidByPath.get(path)).filter((guid) => Boolean(guid));
+  }
+  return result;
+}
+async function mapLimit(items, limit, task) {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+      await task(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+// src/vault-transfer.ts
+function safeTransferPath(value, root = false) {
+  return typeof value === "string" && (value === "" ? root : !/[\\:\x00-\x1f]/.test(value) && value.split("/").every((part) => Boolean(part) && part !== "." && part !== ".." && !part.startsWith(".") && part !== "__proto__"));
+}
+function parseVaultTransfer(value) {
+  var _a;
+  const v = value;
+  if (!v || v.format !== "yuque-vault-transfer" || v.version !== 1 || !Array.isArray(v.items) || !v.orders || typeof v.orders !== "object" || Array.isArray(v.orders)) throw new Error("\u4E0D\u662F\u6709\u6548\u7684\u8DE8 Vault \u987A\u5E8F\u5305 v1");
+  const paths = /* @__PURE__ */ new Map();
+  for (const item of v.items) {
+    if (!item || !safeTransferPath(item.path) || !["file", "folder"].includes(item.kind) || typeof item.guid !== "string" || !/^[A-Za-z0-9:_-]+$/.test(item.guid) || item.guid.length > 256 || ["__proto__", "constructor", "prototype"].includes(item.guid)) throw new Error("\u987A\u5E8F\u5305\u5305\u542B\u65E0\u6548\u8DEF\u5F84\u6216\u8EAB\u4EFD");
+    if (paths.has(item.path)) throw new Error(`\u6765\u6E90\u5B58\u5728\u91CD\u590D\u8DEF\u5F84\uFF1A${item.path}`);
+    paths.set(item.path, item);
+  }
+  const ordered = /* @__PURE__ */ new Set();
+  for (const [parent, children] of Object.entries(v.orders)) {
+    if (!safeTransferPath(parent, true) || parent && ((_a = paths.get(parent)) == null ? void 0 : _a.kind) !== "folder" || !Array.isArray(children)) throw new Error(`\u76EE\u5F55\u7D22\u5F15\u65E0\u6548\uFF1A${parent}`);
+    for (const child of children) {
+      if (typeof child !== "string" || !paths.has(child) || child.split("/").slice(0, -1).join("/") !== parent || ordered.has(child)) throw new Error(`\u5B50\u9879\u7D22\u5F15\u65E0\u6548\uFF1A${child}`);
+      ordered.add(child);
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(v.orders, "") || ordered.size !== paths.size || v.items.some((item) => item.kind === "folder" && !Object.prototype.hasOwnProperty.call(v.orders, item.path))) throw new Error("\u6765\u6E90\u76EE\u5F55\u7D22\u5F15\u4E0D\u5B8C\u6574");
+  const mergeChoices = /* @__PURE__ */ Object.create(null);
+  if (v.mergeChoices && typeof v.mergeChoices === "object") {
+    for (const [token, choice] of Object.entries(v.mergeChoices)) if (/^[A-Za-z0-9_-]+$/.test(token) && typeof choice === "boolean") mergeChoices[token] = choice;
+  }
+  return { format: v.format, version: 1, items: v.items, orders: v.orders, mergeChoices };
+}
+function planTransferGuids(items, occupied, generate) {
+  var _a;
+  const used = new Set(occupied);
+  const byPath = new Map(items.map((item) => [item.path, item]));
+  const result = /* @__PURE__ */ new Map();
+  const counts = /* @__PURE__ */ new Map();
+  for (const item of items) counts.set(item.guid, (counts.get(item.guid) || 0) + 1);
+  const conflict = (guid) => occupied.has(guid) || counts.get(guid) > 1;
+  for (const item of items) used.add(item.guid);
+  for (const item of items.filter((item2) => item2.kind === "folder").concat(items.filter((item2) => item2.kind === "file"))) {
+    if (result.has(item.path)) continue;
+    const name = item.path.split("/").pop();
+    const note = item.kind === "folder" ? byPath.get(`${item.path}/${name}.md`) : void 0;
+    const token = (_a = /^d[:-]([A-Za-z0-9_-]+)$/.exec(item.guid)) == null ? void 0 : _a[1];
+    if ((note == null ? void 0 : note.kind) === "file" && token && note.guid.slice(2) === token && /^f[:-]/.test(note.guid)) {
+      let folderGuid = item.guid;
+      let noteGuid = note.guid;
+      if (conflict(folderGuid) || conflict(noteGuid)) {
+        let found = false;
+        for (let attempt = 0; attempt < 32; attempt++) {
+          folderGuid = generate("d", used);
+          noteGuid = `f-${folderGuid.slice(2)}`;
+          if (!used.has(noteGuid)) {
+            used.add(noteGuid);
+            found = true;
+            break;
+          }
+        }
+        if (!found) throw new Error("\u65E0\u6CD5\u751F\u6210\u552F\u4E00\u914D\u5BF9 GUID");
+      }
+      result.set(item.path, folderGuid);
+      result.set(note.path, noteGuid);
+    } else result.set(item.path, conflict(item.guid) ? generate(item.kind === "folder" ? "d" : "f", used) : item.guid);
+  }
+  return result;
+}
+
+// src/local-copy.ts
+var key = (name) => name.normalize("NFC").toLowerCase();
+function portableCopyName(name) {
+  return safeTransferPath(name) && !name.includes("/") && !/[<>"|?*]/.test(name) && !/[. ]$/.test(name) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name);
+}
+function planCopyRoots(names, existing, choices) {
+  const occupied = /* @__PURE__ */ new Map();
+  for (const name of existing) {
+    if (occupied.has(key(name))) throw new Error(`\u76EE\u6807\u5B58\u5728\u5927\u5C0F\u5199\u6216 Unicode \u7B49\u4EF7\u91CD\u540D\uFF1A${name}`);
+    occupied.set(key(name), name);
+  }
+  const sourceKeys = /* @__PURE__ */ new Set();
+  for (const name of names) {
+    if (!portableCopyName(name) || sourceKeys.has(key(name))) throw new Error(`\u6765\u6E90\u540D\u79F0\u4E0D\u5B89\u5168\u6216\u5927\u5C0F\u5199\u91CD\u540D\uFF1A${name}`);
+    sourceKeys.add(key(name));
+  }
+  const reserved = /* @__PURE__ */ new Set([...occupied.keys(), ...sourceKeys]);
+  const assigned = /* @__PURE__ */ new Set();
+  return names.map((source, index) => {
+    const collision = occupied.get(key(source));
+    const choice = choices.get(source);
+    if (collision && !choice) throw new Error(`\u8BF7\u9009\u62E9\u540C\u540D\u9879\u5904\u7406\u65B9\u5F0F\uFF1A${source}`);
+    let target = source;
+    let replaces = false;
+    if ((choice == null ? void 0 : choice.mode) === "replace" && collision) {
+      target = collision;
+      replaces = true;
+    } else if ((choice == null ? void 0 : choice.mode) === "rename") {
+      target = (choice.name || "").trim();
+      if (!portableCopyName(target) || key(target) !== key(source) && reserved.has(key(target)) || occupied.has(key(target))) throw new Error(`\u65B0\u540D\u79F0\u65E0\u6548\u6216\u5DF2\u88AB\u5360\u7528\uFF1A${target}`);
+    } else if ((choice == null ? void 0 : choice.mode) === "number") {
+      const stem = `${String(index + 1).padStart(3, "0")}-${source}`;
+      target = stem;
+      let retry = 2;
+      while (reserved.has(key(target))) target = `${String(index + 1).padStart(3, "0")}-${retry++}-${source}`;
+    } else if (collision && !replaces) throw new Error(`\u672A\u89E3\u51B3\u540C\u540D\u9879\uFF1A${source}`);
+    if (assigned.has(key(target))) throw new Error(`\u4E24\u4E2A\u8FC1\u5165\u9879\u4F7F\u7528\u540C\u4E00\u540D\u79F0\uFF1A${target}`);
+    reserved.add(key(target));
+    assigned.add(key(target));
+    return { source, target, replaces };
+  });
+}
+function copyPathMap(pack, roots) {
+  const rootMap = new Map(roots.map((root) => [root.source, root.target]));
+  const pairs = /* @__PURE__ */ new Map();
+  const byPath = new Map(pack.items.map((item) => [item.path, item]));
+  for (const root of roots) {
+    const folder = byPath.get(root.source);
+    const extension = (name) => name.includes(".") ? name.slice(name.lastIndexOf(".")).toLowerCase() : "";
+    if ((folder == null ? void 0 : folder.kind) === "file" && extension(root.source) !== extension(root.target)) throw new Error(`\u6587\u4EF6\u91CD\u547D\u540D\u9700\u4FDD\u7559\u6269\u5C55\u540D\uFF1A${root.source}`);
+    const notePath = `${root.source}/${root.source}.md`;
+    const note = byPath.get(notePath);
+    if (root.source !== root.target && (folder == null ? void 0 : folder.kind) === "folder" && /^d[:-]/.test(folder.guid) && (note == null ? void 0 : note.kind) === "file" && /^f[:-]/.test(note.guid) && folder.guid.slice(2) === note.guid.slice(2)) {
+      const desired = `${root.source}/${root.target}.md`;
+      if (pack.orders[root.source].some((path) => key(path) === key(desired) && path !== notePath)) throw new Error(`\u91CD\u547D\u540D\u4F1A\u4E0E\u914D\u5BF9\u7B14\u8BB0\u7684\u5144\u5F1F\u6587\u4EF6\u51B2\u7A81\uFF1A${desired}`);
+      pairs.set(notePath, `${root.target}/${root.target}.md`);
+    }
+  }
+  return new Map(pack.items.map((item) => {
+    const slash = item.path.indexOf("/");
+    const first = slash < 0 ? item.path : item.path.slice(0, slash);
+    const renamed = rootMap.get(first);
+    if (!renamed) throw new Error(`\u7F3A\u5C11\u590D\u5236\u8BA1\u5212\uFF1A${item.path}`);
+    return [item.path, pairs.get(item.path) || renamed + (slash < 0 ? "" : item.path.slice(slash))];
+  }));
+}
+function stamp(stat) {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs, stat.isDirectory()].join(":");
+}
+async function exists(io, path) {
+  try {
+    await io.fs.promises.lstat(path);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+function contained(io, root, target) {
+  const rel = io.path.relative(root, target);
+  return rel === "" || !io.path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${io.path.sep}`);
+}
+async function checkedDirectory(io, value) {
+  if (!io.path.isAbsolute(value)) throw new Error("\u6765\u6E90\u5FC5\u987B\u662F\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84");
+  const full = io.path.resolve(value);
+  let cursor = full;
+  while (true) {
+    const stat = await io.fs.promises.lstat(cursor);
+    if (stat.isSymbolicLink()) throw new Error(`\u4E0D\u652F\u6301\u7B26\u53F7\u94FE\u63A5\u6216\u76EE\u5F55\u8054\u63A5\uFF1A${cursor}`);
+    const parent = io.path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  if (!(await io.fs.promises.stat(full)).isDirectory()) throw new Error(`\u4E0D\u662F\u76EE\u5F55\uFF1A${full}`);
+  return io.fs.promises.realpath(full);
+}
+async function resolveCopyDestination(io, vaultRoot, input) {
+  const absolute = input ? io.path.resolve(vaultRoot, input) : vaultRoot;
+  if (!contained(io, vaultRoot, absolute)) throw new Error("\u76EE\u6807\u5FC5\u987B\u662F\u5F53\u524D Vault \u6216\u5176\u5185\u90E8\u76EE\u5F55\uFF0C\u4E0D\u80FD\u9009\u62E9\u5E93\u5916\u76EE\u5F55");
+  const relative = io.path.relative(vaultRoot, absolute).split(io.path.sep).join("/");
+  if (!safeTransferPath(relative, true) || relative.split("/").some((part) => part && !portableCopyName(part))) throw new Error("\u76EE\u6807\u76EE\u5F55\u540D\u79F0\u65E0\u6548\uFF0C\u4E0D\u652F\u6301\u9690\u85CF\u76EE\u5F55\u3001\u4E0A\u7EA7\u8DEF\u5F84\u6216\u7279\u6B8A\u540D\u79F0");
+  const missing = [];
+  let cursor = vaultRoot, rel = "", parentExists = true;
+  for (const name of relative ? relative.split("/") : []) {
+    if (parentExists) {
+      const siblings = await io.fs.promises.readdir(cursor);
+      const equivalent = siblings.find((other) => key(other) === key(name));
+      if (equivalent && equivalent !== name) throw new Error(`\u76EE\u6807\u76EE\u5F55\u540D\u79F0\u5927\u5C0F\u5199\u6216 Unicode \u4E0D\u4E00\u81F4\uFF0C\u8BF7\u901A\u8FC7\u9009\u62E9\u76EE\u5F55\u586B\u5165\u5B9E\u9645\u8DEF\u5F84\uFF1A${name}`);
+    }
+    cursor = io.path.join(cursor, name);
+    rel = rel ? `${rel}/${name}` : name;
+    if (parentExists && await exists(io, cursor)) await checkedDirectory(io, cursor);
+    else {
+      parentExists = false;
+      missing.push(rel);
+    }
+  }
+  return { absolute, relative, missing };
+}
+async function scanDisk(io, root, hidden = false) {
+  const result = [];
+  const pending = [""];
+  while (pending.length) {
+    const relative = pending.pop();
+    const absolute = io.path.join(root, relative);
+    const stat = await io.fs.promises.lstat(absolute);
+    if (stat.isSymbolicLink() || !stat.isDirectory() && !stat.isFile()) throw new Error(`\u4E0D\u652F\u6301\u94FE\u63A5\u6216\u7279\u6B8A\u6587\u4EF6\uFF1A${absolute}`);
+    result.push({ path: relative, kind: stat.isDirectory() ? "folder" : "file", stamp: stamp(stat), size: stat.size, mtimeMs: stat.mtimeMs });
+    if (stat.isDirectory()) {
+      const names = await io.fs.promises.readdir(absolute);
+      const keys = /* @__PURE__ */ new Set();
+      for (const name of names) {
+        if (!hidden && name.startsWith(".")) continue;
+        if (!hidden && !portableCopyName(name)) throw new Error(`\u6765\u6E90\u540D\u79F0\u4E0D\u652F\u6301\u5B89\u5168\u590D\u5236\uFF1A${name}`);
+        if (keys.has(key(name))) throw new Error(`\u76EE\u5F55\u5B58\u5728\u5927\u5C0F\u5199\u6216 Unicode \u7B49\u4EF7\u91CD\u540D\uFF1A${absolute}/${name}`);
+        keys.add(key(name));
+        pending.push(relative ? `${relative}/${name}` : name);
+      }
+    }
+    if (result.length % 250 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return result;
+}
+async function verifyDisk(io, root, expected, hidden = false) {
+  const current = await scanDisk(io, root, hidden);
+  const before = new Map(expected.map((entry) => [entry.path, entry.stamp]));
+  if (current.length !== expected.length || current.some((entry) => before.get(entry.path) !== entry.stamp)) throw new Error(`\u9884\u68C0\u540E\u5185\u5BB9\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0\uFF1A${root}`);
+}
+async function verifyInstalledCopies(io, target, roots, staged) {
+  const expected = new Map(staged.filter((entry) => entry.path).map((entry) => [entry.path, entry]));
+  let count = 0;
+  for (const root of roots) {
+    for (const entry of await scanDisk(io, io.path.join(target, root.target), true)) {
+      const relative = entry.path ? `${root.target}/${entry.path}` : root.target;
+      const previous = expected.get(relative);
+      count++;
+      if (!previous || previous.kind !== entry.kind || entry.kind === "file" && (previous.size !== entry.size || Math.abs(previous.mtimeMs - entry.mtimeMs) >= 2)) throw new Error(`\u5B89\u88C5\u540E\u7684\u526F\u672C\u53D1\u751F\u53D8\u5316\uFF1A${relative}`);
+    }
+  }
+  if (count !== expected.size) throw new Error("\u5B89\u88C5\u540E\u7684\u526F\u672C\u9879\u76EE\u96C6\u5408\u53D1\u751F\u53D8\u5316");
+}
+async function markdownHeader(io, path) {
+  const handle = await io.fs.promises.open(path, "r");
+  try {
+    const size = (await handle.stat()).size;
+    for (const limit of [4096, 256 * 1024]) {
+      const buffer = new Uint8Array(Math.min(size, limit));
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+        if (!chunk.bytesRead) break;
+        bytesRead += chunk.bytesRead;
+      }
+      const bom = buffer[0] === 239 && buffer[1] === 187 && buffer[2] === 191;
+      const text = new TextDecoder().decode(buffer.subarray(bom ? 3 : 0, bytesRead));
+      const eol = text.includes("\r\n") ? "\r\n" : "\n";
+      if (!/^---[ \t]*\r?\n/.test(text)) return { yaml: null, offset: bom ? 3 : 0, bom, eol };
+      const match = /^---[ \t]*\r?\n([\s\S]*?)^---[ \t]*(?:\r?\n|$)/m.exec(text);
+      if (match && (match[0].endsWith("\n") || bytesRead === size)) return { yaml: match[1], offset: new TextEncoder().encode(match[0]).length + (bom ? 3 : 0), bom, eol };
+      if (bytesRead === size) break;
+    }
+    throw new Error(`frontmatter \u672A\u95ED\u5408\u6216\u8D85\u8FC7 256 KiB\uFF1A${path}`);
+  } finally {
+    await handle.close();
+  }
+}
+async function copyMarkdown(io, source, destination, yaml, header) {
+  const input = await io.fs.promises.open(source, "r");
+  let output;
+  try {
+    output = await io.fs.promises.open(destination, "wx");
+    await output.writeFile(`${header.bom ? "\uFEFF" : ""}---${header.eol}${yaml.replace(/\s+$/, "").replace(/\r?\n/g, header.eol)}${header.eol}---${header.eol}`);
+    const buffer = new Uint8Array(64 * 1024);
+    let position = header.offset;
+    while (true) {
+      const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
+      if (!bytesRead) break;
+      let written = 0;
+      while (written < bytesRead) written += (await output.write(buffer, written, bytesRead - written, null)).bytesWritten;
+      position += bytesRead;
+    }
+  } finally {
+    await input.close();
+    if (output) await output.close();
+  }
+}
+async function installCopies(io, options) {
+  var _a, _b;
+  const { roots, target, workspace } = options;
+  await checkedDirectory(io, target);
+  if (!contained(io, io.path.dirname(workspace), workspace) || contained(io, workspace, target)) throw new Error("\u5907\u4EFD\u8DEF\u5F84\u4E0E\u76EE\u6807\u51B2\u7A81");
+  await options.verify();
+  const installed = [], backedUp = [];
+  const journalPath = io.path.join(workspace, "transaction.json");
+  const journal = async (phase, root) => {
+    await io.fs.promises.appendFile(io.path.join(workspace, "progress.jsonl"), JSON.stringify({ phase, root }) + "\n");
+  };
+  await io.fs.promises.mkdir(io.path.join(workspace, "originals"));
+  await io.fs.promises.writeFile(journalPath, JSON.stringify({ version: 1, target, roots }), { flag: "wx" });
+  await journal("prepared");
+  try {
+    for (const root of roots) {
+      (_a = options.checkCancelled) == null ? void 0 : _a.call(options);
+      if (!portableCopyName(root.target) || !portableCopyName(root.source)) throw new Error("\u590D\u5236\u540D\u79F0\u65E0\u6548");
+      const destination = io.path.join(target, root.target);
+      if (root.replaces) {
+        if (!await exists(io, destination)) throw new Error(`\u66FF\u6362\u76EE\u6807\u5DF2\u6D88\u5931\uFF1A${root.target}`);
+        await io.fs.promises.rename(destination, io.path.join(workspace, "originals", root.target));
+        backedUp.push(root);
+        await journal("backed-up", root);
+      } else if (await exists(io, destination)) throw new Error(`\u76EE\u6807\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u521B\u5EFA\uFF1A${root.target}`);
+      await io.fs.promises.rename(io.path.join(workspace, "staged", root.target), destination);
+      installed.push(root);
+      await journal("installed", root);
+    }
+    (_b = options.checkCancelled) == null ? void 0 : _b.call(options);
+    await options.commitData();
+    await journal("complete");
+  } catch (error) {
+    const failures = [];
+    for (const root of installed.slice().reverse()) {
+      try {
+        await io.fs.promises.rename(io.path.join(target, root.target), io.path.join(workspace, "staged", root.target));
+      } catch (e) {
+        failures.push(root.target);
+      }
+    }
+    for (const root of backedUp.slice().reverse()) {
+      try {
+        const destination = io.path.join(target, root.target);
+        if (await exists(io, destination)) throw new Error("\u76EE\u6807\u88AB\u5360\u7528");
+        await io.fs.promises.rename(io.path.join(workspace, "originals", root.target), destination);
+      } catch (e) {
+        failures.push(root.target);
+      }
+    }
+    try {
+      await options.rollbackData();
+    } catch (e) {
+      failures.push("data.json");
+    }
+    await journal(failures.length ? "recovery-required" : "rolled-back").catch(() => void 0);
+    throw new Error(`${String(error)}\uFF1B${failures.length ? `\u56DE\u6EDA\u4E0D\u5B8C\u6574\uFF1A${failures.join("\uFF1B")}` : "\u5DF2\u56DE\u6EDA"}\u3002\u4FDD\u7559\u6062\u590D\u76EE\u5F55\uFF1A${workspace}`);
+  }
+}
+
+// src/directory-picker.ts
+async function chooseDirectory(load, title, initial) {
+  var _a, _b;
+  const electron = load("electron");
+  let dialog = electron.dialog || ((_a = electron.remote) == null ? void 0 : _a.dialog);
+  if (!dialog) {
+    try {
+      dialog = load("@electron/remote").dialog;
+    } catch (e) {
+    }
+  }
+  if (dialog == null ? void 0 : dialog.showOpenDialog) {
+    const result = await dialog.showOpenDialog({ title, defaultPath: initial || void 0, properties: ["openDirectory", "dontAddToRecent"] });
+    return result.canceled ? null : ((_b = result.filePaths) == null ? void 0 : _b[0]) || null;
+  }
+  const process = load("process");
+  if (process.platform !== "win32") throw new Error("\u5F53\u524D\u5BBF\u4E3B\u672A\u63D0\u4F9B\u76EE\u5F55\u9009\u62E9\u7A97\u53E3\uFF0C\u8BF7\u624B\u52A8\u586B\u5199\u7EDD\u5BF9\u8DEF\u5F84");
+  const script = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Add-Type -AssemblyName System.Windows.Forms; $picker = New-Object System.Windows.Forms.FolderBrowserDialog; $picker.Description = $env:YQ_PICK_TITLE; $picker.SelectedPath = $env:YQ_PICK_INITIAL; $picker.ShowNewFolderButton = $false; try { if ($picker.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($picker.SelectedPath) } } finally { $picker.Dispose() }";
+  return new Promise((resolve, reject) => {
+    load("child_process").execFile(
+      "powershell.exe",
+      ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script],
+      { windowsHide: true, encoding: "utf8", maxBuffer: 64 * 1024, env: { ...process.env, YQ_PICK_TITLE: title, YQ_PICK_INITIAL: initial } },
+      (error, stdout) => error ? reject(new Error("\u65E0\u6CD5\u6253\u5F00\u7CFB\u7EDF\u76EE\u5F55\u9009\u62E9\u7A97\u53E3\uFF0C\u8BF7\u624B\u52A8\u586B\u5199\u7EDD\u5BF9\u8DEF\u5F84")) : resolve(stdout.trim() || null)
+    );
+  });
+}
+
+// src/local-source.ts
+function yamlObject(value) {
+  if (value == null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("Markdown frontmatter \u5FC5\u987B\u662F YAML \u5BF9\u8C61");
+  return value;
+}
+async function sourceTransfer(io, root, entries, pluginId, generate, parseYaml2) {
+  var _a, _b, _c, _d, _e;
+  let cursor = root, vaultRoot = root, data = {}, metadataPath = "", metadataText = "";
+  while (true) {
+    let candidate = io.path.join(cursor, ".obsidian", "plugins", pluginId, "data.json");
+    if (pluginId === "yuque-sorting" && !await exists(io, candidate)) candidate = io.path.join(cursor, ".obsidian", "plugins", "yuque-order-drag", "data.json");
+    if (await exists(io, candidate)) {
+      await checkedDirectory(io, io.path.dirname(candidate));
+      if ((await io.fs.promises.lstat(candidate)).isSymbolicLink()) throw new Error("\u6765\u6E90\u63D2\u4EF6\u6570\u636E\u4E0D\u80FD\u662F\u7B26\u53F7\u94FE\u63A5");
+      if ((await io.fs.promises.stat(candidate)).size > 64 * 1024 * 1024) throw new Error("\u6765\u6E90\u63D2\u4EF6\u6570\u636E\u8D85\u8FC7 64 MiB\uFF0C\u8BF7\u4F7F\u7528\u624B\u52A8\u987A\u5E8F\u5305");
+      metadataPath = candidate;
+      metadataText = await io.fs.promises.readFile(candidate, "utf8");
+      data = JSON.parse(metadataText);
+      vaultRoot = cursor;
+      break;
+    }
+    if (await exists(io, io.path.join(cursor, ".obsidian"))) break;
+    const parent = io.path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  if (!data || typeof data !== "object") throw new Error("\u6765\u6E90 data.json \u65E0\u6548");
+  const pack = { format: "yuque-vault-transfer", version: 1, items: [], orders: /* @__PURE__ */ Object.create(null), mergeChoices: /* @__PURE__ */ Object.create(null) };
+  const used = /* @__PURE__ */ new Set();
+  const grouped = /* @__PURE__ */ new Map();
+  grouped.set("", []);
+  const base = io.path.relative(vaultRoot, root).split(io.path.sep).join("/");
+  const fullPath = (relative) => base ? relative ? `${base}/${relative}` : base : relative;
+  let generated = 0, fallback = 0;
+  for (const entry of entries) {
+    if (!entry.path) continue;
+    let raw;
+    if (entry.kind === "file" && /\.md$/i.test(entry.path)) {
+      const header = await markdownHeader(io, io.path.join(root, entry.path));
+      raw = header.yaml === null ? null : yamlObject(parseYaml2(header.yaml)).guid;
+    } else raw = (_a = entry.kind === "folder" ? data.folderGuids : data.fileGuids) == null ? void 0 : _a[fullPath(entry.path)];
+    const guid = typeof raw === "string" && /^[A-Za-z0-9:_-]{1,256}$/.test(raw) && !["__proto__", "constructor", "prototype"].includes(raw) ? raw : generate(entry.kind === "folder" ? "d" : "f", used);
+    if (raw !== guid) generated++;
+    used.add(guid);
+    const item = { path: entry.path, kind: entry.kind, guid };
+    pack.items.push(item);
+    if (pack.items.length % 250 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    const parent = entry.path.split("/").slice(0, -1).join("/");
+    if (!grouped.has(parent)) grouped.set(parent, []);
+    grouped.get(parent).push(item);
+    if (entry.kind === "folder" && !grouped.has(entry.path)) grouped.set(entry.path, []);
+  }
+  const byPath = new Map(pack.items.map((item) => [item.path, item]));
+  const collator = new Intl.Collator(void 0, { numeric: true, sensitivity: "base" });
+  for (const [parent, children] of grouped) {
+    const sourcePath = fullPath(parent);
+    const folderGuid = (_b = data.folderGuids) == null ? void 0 : _b[sourcePath || "/"];
+    const saved = (_c = data.orderByFolder) == null ? void 0 : _c[folderGuid || (sourcePath ? "" : "__root__")];
+    const rank = /* @__PURE__ */ new Map();
+    if (Array.isArray(saved)) saved.forEach((guid, index) => {
+      if (!rank.has(guid)) rank.set(guid, index);
+    });
+    fallback += children.filter((item) => !rank.has(item.guid)).length;
+    children.sort((a, b) => {
+      var _a2, _b2;
+      return ((_a2 = rank.get(a.guid)) != null ? _a2 : Number.MAX_SAFE_INTEGER) - ((_b2 = rank.get(b.guid)) != null ? _b2 : Number.MAX_SAFE_INTEGER) || collator.compare(a.path, b.path) || a.path.localeCompare(b.path);
+    });
+    pack.orders[parent] = children.map((item) => item.path);
+    if (parent) {
+      const guid = byPath.get(parent).guid;
+      const choice = (_d = data.folderNoteMergeOverrides) == null ? void 0 : _d[guid.slice(2)];
+      pack.mergeChoices[guid.slice(2)] = typeof choice === "boolean" ? choice : Boolean((_e = data.settings) == null ? void 0 : _e.mergePairedFolderNotes);
+    }
+  }
+  return { pack: parseVaultTransfer(pack), fallback, generated, metadataPath, metadataText };
+}
+
 // main.ts
 var MANIFEST_NAME = "_yuque_order.json";
+var GUID_FRONTMATTER_KEY = "guid";
 var DEFAULT_SETTINGS = {
-  orderFrontmatterKey: "guid",
   newItemPlacement: "bottom",
   fallbackSort: "name-last",
   persistOrderOnCreateDelete: true,
-  enableDrag: true
+  enableDrag: true,
+  guidBits: 64,
+  scanDuplicateGuidsOnStartup: false,
+  mergePairedFolderNotes: false
 };
 function isMarkdown(file) {
   return file instanceof import_obsidian.TFile && file.extension.toLowerCase() === "md";
@@ -277,42 +848,25 @@ function basename(path) {
 function stripMarkdown(path) {
   return path.replace(/\.md$/i, "");
 }
-function createGuid(prefix = "obs") {
-  var _a, _b;
-  const uuid = (_b = (_a = globalThis.crypto) == null ? void 0 : _a.randomUUID) == null ? void 0 : _b.call(_a);
-  return `${prefix}-${uuid || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+function createGuid(kind, bits = 64, used) {
+  return createTypedGuid(kind, bits, used);
 }
-function manifestIssueCount(report) {
-  return report.missing.length + report.extra.length + report.moved.length + report.duplicateManifestGuids.length + report.duplicateActualGuids.length + report.invalidManifests.length;
+function yieldToUi() {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
-var ManifestImportConfirmModal = class extends import_obsidian.Modal {
-  constructor(app, report, resolveChoice) {
+var ConfirmActionModal = class extends import_obsidian.Modal {
+  constructor(app, titleText, message, confirmText, resolveChoice) {
     super(app);
-    this.report = report;
+    this.titleText = titleText;
+    this.message = message;
+    this.confirmText = confirmText;
     this.resolveChoice = resolveChoice;
     this.settled = false;
   }
   onOpen() {
-    this.setTitle("\u8BED\u96C0\u987A\u5E8F\u6E05\u5355\u4E0E\u5F53\u524D\u5E93\u4E0D\u4E00\u81F4");
-    this.contentEl.createEl("p", {
-      text: "\u7EE7\u7EED\u5BFC\u5165\u53EA\u4F1A\u8C03\u6574\u80FD\u591F\u5339\u914D\u7684\u9879\u76EE\u987A\u5E8F\uFF0C\u4E0D\u4F1A\u521B\u5EFA\u3001\u5220\u9664\u6216\u79FB\u52A8\u6587\u4EF6\u3002\u8BF7\u786E\u8BA4\u662F\u5426\u7EE7\u7EED\u3002"
-    });
-    const groups = [
-      ["\u6E05\u5355\u4E2D\u6709\u3001\u5F53\u524D\u5E93\u7F3A\u5931", this.report.missing.map((entry) => entry.label)],
-      ["\u5F53\u524D\u5E93\u591A\u51FA\u7684\u9879\u76EE", this.report.extra.map((entry) => entry.label)],
-      ["\u6240\u5728\u76EE\u5F55\u4E0E\u6E05\u5355\u4E0D\u7B26", this.report.moved.map(({ actual }) => actual.label)],
-      ["\u6E05\u5355\u4E2D\u7684\u91CD\u590D GUID", this.report.duplicateManifestGuids],
-      ["\u5F53\u524D\u5E93\u4E2D\u7684\u91CD\u590D GUID", this.report.duplicateActualGuids],
-      ["\u65E0\u6CD5\u8BFB\u53D6\u7684\u6E05\u5355", this.report.invalidManifests]
-    ];
-    groups.forEach(([title, items]) => {
-      if (!items.length) return;
-      this.contentEl.createEl("h4", { text: `${title}\uFF08${items.length}\uFF09` });
-      const list = this.contentEl.createEl("ul");
-      items.slice(0, 8).forEach((item) => list.createEl("li", { text: item }));
-      if (items.length > 8) list.createEl("li", { text: `\u53E6\u6709 ${items.length - 8} \u9879\u2026\u2026` });
-    });
-    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("\u653E\u5F03").onClick(() => this.finish(false))).addButton((button) => button.setButtonText("\u4ECD\u7136\u5BFC\u5165").setWarning().onClick(() => this.finish(true)));
+    this.setTitle(this.titleText);
+    this.contentEl.createEl("p", { text: this.message });
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.finish(false))).addButton((button) => button.setButtonText(this.confirmText).setWarning().onClick(() => this.finish(true)));
   }
   onClose() {
     this.contentEl.empty();
@@ -323,6 +877,115 @@ var ManifestImportConfirmModal = class extends import_obsidian.Modal {
     this.settled = true;
     this.resolveChoice(choice);
     this.close();
+  }
+};
+var CopyConflictModal = class extends import_obsidian.Modal {
+  constructor(app, names, resolveChoices) {
+    super(app);
+    this.names = names;
+    this.resolveChoices = resolveChoices;
+    this.settled = false;
+    this.page = 0;
+    this.choices = /* @__PURE__ */ new Map();
+    names.forEach((name) => this.choices.set(name, { mode: "number" }));
+  }
+  onOpen() {
+    this.render();
+  }
+  render() {
+    this.contentEl.empty();
+    this.setTitle(`\u5904\u7406 ${this.names.length} \u4E2A\u540C\u7EA7\u91CD\u540D\u9879`);
+    this.contentEl.createEl("p", { text: "\u66FF\u6362\uFF1D\u6574\u4E2A\u6587\u4EF6\u6216\u6587\u4EF6\u5939\u66FF\u6362\uFF0C\u76EE\u6807\u72EC\u6709\u5B50\u9879\u4E5F\u4F1A\u79FB\u5165\u5907\u4EFD\u3002\u91CD\u547D\u540D\u548C\u7F16\u53F7\u53EA\u4FEE\u6539\u8FC1\u5165\u526F\u672C\u3002\u6BCF\u9875\u6700\u591A 50 \u9879\u3002\u5173\u95ED\u6216\u53D6\u6D88\u4E0D\u4F1A\u590D\u5236\u3002" });
+    new import_obsidian.Setting(this.contentEl).setName("\u7EDF\u4E00\u5904\u7406\u5168\u90E8\u51B2\u7A81").addDropdown((dropdown) => dropdown.addOption("", "\u8BF7\u9009\u62E9\u6279\u91CF\u64CD\u4F5C").addOption("number", "\u81EA\u52A8\u6309\u6765\u6E90\u987A\u5E8F\u7F16\u53F7").addOption("replace", "\u5168\u90E8\u66FF\u6362\uFF08\u540E\u7EED\u518D\u6B21\u786E\u8BA4\uFF09").onChange((value) => {
+      if (!value) return;
+      this.names.forEach((name) => this.choices.set(name, { mode: value }));
+      this.render();
+    }));
+    for (const name of this.names.slice(this.page * 50, (this.page + 1) * 50)) {
+      const choice = this.choices.get(name);
+      const row = new import_obsidian.Setting(this.contentEl).setName(name);
+      row.addDropdown((dropdown) => dropdown.addOption("number", "\u81EA\u52A8\u7F16\u53F7").addOption("rename", "\u91CD\u547D\u540D").addOption("replace", "\u6574\u9879\u66FF\u6362").setValue(choice.mode).onChange((value) => {
+        this.choices.set(name, { mode: value, name: choice.name });
+        this.render();
+      }));
+      if (choice.mode === "rename") row.addText((text) => text.setPlaceholder("\u65B0\u540D\u79F0\uFF0C\u6587\u4EF6\u8BF7\u4FDD\u7559\u6269\u5C55\u540D").setValue(choice.name || "").onChange((value) => {
+        choice.name = value;
+      }));
+    }
+    new import_obsidian.Setting(this.contentEl).setName(`\u7B2C ${this.page + 1} / ${Math.ceil(this.names.length / 50)} \u9875`).addButton((button) => button.setButtonText("\u4E0A\u4E00\u9875").setDisabled(this.page === 0).onClick(() => {
+      this.page--;
+      this.render();
+    })).addButton((button) => button.setButtonText("\u4E0B\u4E00\u9875").setDisabled((this.page + 1) * 50 >= this.names.length).onClick(() => {
+      this.page++;
+      this.render();
+    }));
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.finish(null))).addButton((button) => button.setButtonText("\u67E5\u770B\u6700\u7EC8\u590D\u5236\u8BA1\u5212").setCta().onClick(() => this.finish(this.choices)));
+  }
+  finish(choice) {
+    this.settled = true;
+    this.resolveChoices(choice);
+    this.close();
+  }
+  onClose() {
+    this.contentEl.empty();
+    if (!this.settled) this.resolveChoices(null);
+  }
+};
+var IdentitySelectionModal = class extends import_obsidian.Modal {
+  constructor(app, items, onSubmit) {
+    super(app);
+    this.items = items;
+    this.onSubmit = onSubmit;
+    this.selected = /* @__PURE__ */ new Set();
+    this.query = "";
+  }
+  onOpen() {
+    this.setTitle("\u9009\u62E9\u8981\u7EB3\u5165\u7BA1\u7406\u7684\u6587\u4EF6\u548C\u6587\u4EF6\u5939");
+    this.contentEl.createEl("p", { text: "\u53EF\u641C\u7D22\u5E76\u52FE\u9009\u5F53\u524D\u5E93\u4E2D\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939" });
+    const search = this.contentEl.createEl("input", {
+      cls: "yq-order-selection-search",
+      attr: { type: "search", placeholder: "\u6309\u8DEF\u5F84\u641C\u7D22" }
+    });
+    this.countEl = this.contentEl.createEl("div", { cls: "setting-item-description" });
+    this.listEl = this.contentEl.createDiv({ cls: "yq-order-selection-list" });
+    search.addEventListener("input", () => {
+      this.query = search.value.trim().toLocaleLowerCase();
+      this.renderList();
+    });
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton((button) => button.setButtonText("\u4EC5\u751F\u6210\u7F3A\u5931 GUID").onClick(() => this.finish("missing"))).addButton((button) => button.setButtonText("\u91CD\u65B0\u751F\u6210\u9009\u4E2D GUID").setWarning().onClick(() => this.finish("regenerate")));
+    this.renderList();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+  renderList() {
+    this.listEl.empty();
+    const visible = this.items.filter((item) => !this.query || item.path.toLocaleLowerCase().includes(this.query)).slice(0, 300);
+    visible.forEach((item) => {
+      const label = this.listEl.createEl("label", { cls: "yq-order-selection-row" });
+      const checkbox = label.createEl("input", { attr: { type: "checkbox" } });
+      checkbox.checked = this.selected.has(item.path);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) this.selected.add(item.path);
+        else this.selected.delete(item.path);
+        this.updateCount();
+      });
+      label.createSpan({ text: `${item instanceof import_obsidian.TFolder ? "\u{1F4C1}" : "\u{1F4C4}"} ${item.path}` });
+    });
+    if (visible.length === 300) this.listEl.createEl("p", { text: "\u5F53\u524D\u6700\u591A\u663E\u793A 300 \u9879\uFF0C\u8BF7\u4F7F\u7528\u641C\u7D22\u7F29\u5C0F\u8303\u56F4\u3002" });
+    this.updateCount();
+  }
+  updateCount() {
+    this.countEl.setText(`\u5DF2\u9009\u62E9 ${this.selected.size} \u9879`);
+  }
+  finish(mode) {
+    if (!this.selected.size) {
+      new import_obsidian.Notice("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u9879\u76EE");
+      return;
+    }
+    const paths = [...this.selected];
+    this.close();
+    this.onSubmit(paths, mode);
   }
 };
 var YqOrderDragPlugin = class extends import_obsidian.Plugin {
@@ -341,6 +1004,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.explorerPatchActive = false;
     this.explorerRefreshFrame = null;
     this.domOrderFrame = null;
+    this.folderNoteFrame = null;
     this.explorerSetup = false;
     this.manifestNoticeShown = false;
     this.dragSourcePath = "";
@@ -352,17 +1016,33 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.pendingDropPlacements = /* @__PURE__ */ new Map();
     this.pendingUndoPositions = /* @__PURE__ */ new Map();
     this.lastDragUndo = null;
+    this.dragUndoStack = [];
     this.undoInProgress = false;
+    this.identityMaintenanceInProgress = false;
+    this.transferInProgress = false;
+    this.transferEvents = [];
+    this.autoCopyScope = null;
+    this.autoCopyPreparing = false;
+    this.autoCopyLastEvent = 0;
+    this.autoCopyCancelled = false;
+    this.autoCopyCreatedDirectories = /* @__PURE__ */ new Set();
+    this.dropInProgress = false;
+    this.handledRenames = /* @__PURE__ */ new WeakMap();
   }
   async onload() {
     this.data = this.normalizeData(await this.loadData());
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleRename(file, oldPath)));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (this.ownsAutoCopyPath(file.path)) this.autoCopyLastEvent = Date.now();
+    }));
     this.registerEvent(this.app.workspace.on("layout-change", () => this.setupExplorer()));
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, item) => this.addIdentityMenuItems(menu, item)));
+    this.installPairedFolderNoteClickHandler();
     this.addCommand({
-      id: "import-yuque-order-manifest",
-      name: "\u5BFC\u5165/\u91CD\u540C\u6B65\u8BED\u96C0\u987A\u5E8F\u6E05\u5355",
+      id: "restore-yuque-order-manifest",
+      name: "\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F",
       callback: () => void this.requestManifestImport()
     });
     this.addCommand({
@@ -374,8 +1054,32 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
       id: "undo-last-yuque-drag",
       name: "\u64A4\u9500\u4E0A\u4E00\u6B21\u8BED\u96C0\u62D6\u62FD",
       checkCallback: (checking) => {
-        if (!this.lastDragUndo || this.undoInProgress) return false;
+        if (!this.lastDragUndo || this.undoInProgress || this.identityMaintenanceInProgress) return false;
         if (!checking) void this.undoLastDrag();
+        return true;
+      }
+    });
+    this.addCommand({ id: "check-duplicate-guids", name: "\u68C0\u6D4B\u5E76\u4FEE\u590D\u91CD\u590D GUID", callback: () => void this.checkDuplicateGuids(true) });
+    this.addCommand({ id: "audit-unmanaged-items", name: "\u68C0\u6D4B\u5E76\u7EB3\u5165\u672A\u7BA1\u7406\u9879\u76EE", callback: () => void this.auditAndOfferManagement() });
+    this.addCommand({ id: "cross-vault-transfer", name: "\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09", callback: () => this.openLocalCopy() });
+    this.addCommand({ id: "copy-from-local-vault", name: "\u4ECE\u672C\u673A Vault\uFF0F\u76EE\u5F55\u81EA\u52A8\u590D\u5236", callback: () => this.openLocalCopy() });
+    this.addCommand({ id: "cancel-local-vault-copy", name: "\u53D6\u6D88\u6B63\u5728\u8FDB\u884C\u7684\u81EA\u52A8\u590D\u5236", checkCallback: (checking) => {
+      if (!this.autoCopyPreparing) return false;
+      if (!checking) {
+        this.autoCopyCancelled = true;
+        new import_obsidian.Notice("\u5C06\u5728\u5F53\u524D\u6587\u4EF6\u590D\u5236\u5B8C\u6210\u540E\u505C\u6B62\uFF1B\u5982\u5DF2\u66FF\u6362\uFF0C\u4F1A\u5C1D\u8BD5\u56DE\u6EDA");
+      }
+      return true;
+    } });
+    this.addCommand({ id: "manage-selected-items", name: "\u9009\u62E9\u9879\u76EE\u5E76\u751F\u6210\u6216\u91CD\u65B0\u751F\u6210 GUID", callback: () => this.openIdentitySelection() });
+    this.addCommand({ id: "replace-all-guids", name: "\u4E3A\u6574\u4E2A\u5E93\u66F4\u6362 GUID", callback: () => void this.replaceAllGuids(this.data.settings.guidBits, true) });
+    this.addCommand({
+      id: "restore-latest-guid-backup",
+      name: "\u6062\u590D\u6700\u8FD1\u4E00\u6B21 GUID \u5907\u4EFD",
+      checkCallback: (checking) => {
+        const latest = this.data.guidBackups[this.data.guidBackups.length - 1];
+        if (!latest || this.identityMaintenanceInProgress) return false;
+        if (!checking) void this.restoreGuidBackup(latest);
         return true;
       }
     });
@@ -384,15 +1088,18 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   }
   async boot() {
     await this.reconcileVault(false);
+    if (this.data.settings.scanDuplicateGuidsOnStartup) await this.checkDuplicateGuids(false);
     this.setupExplorer();
     this.refreshExplorer();
   }
   onunload() {
     var _a, _b, _c;
+    this.autoCopyCancelled = true;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     if (this.saveDirty) void this.enqueueDirtySave();
     if (this.explorerRefreshFrame !== null) window.cancelAnimationFrame(this.explorerRefreshFrame);
     if (this.domOrderFrame !== null) window.cancelAnimationFrame(this.domOrderFrame);
+    if (this.folderNoteFrame !== null) window.cancelAnimationFrame(this.folderNoteFrame);
     (_a = this.explorerObserver) == null ? void 0 : _a.disconnect();
     (_b = this.explorerWaitObserver) == null ? void 0 : _b.disconnect();
     this.clearDragState();
@@ -402,10 +1109,8 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   }
   normalizeData(saved) {
     const savedSettings = (saved == null ? void 0 : saved.settings) || {};
+    const rawSettings = (saved == null ? void 0 : saved.settings) || {};
     const supportedSettings = {};
-    if (typeof savedSettings.orderFrontmatterKey === "string") {
-      supportedSettings.orderFrontmatterKey = savedSettings.orderFrontmatterKey;
-    }
     if (savedSettings.newItemPlacement === "top" || savedSettings.newItemPlacement === "bottom") {
       supportedSettings.newItemPlacement = savedSettings.newItemPlacement;
     }
@@ -418,16 +1123,29 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     if (typeof savedSettings.enableDrag === "boolean") {
       supportedSettings.enableDrag = savedSettings.enableDrag;
     }
+    supportedSettings.guidBits = normalizeGuidBits(savedSettings.guidBits);
+    if (typeof savedSettings.scanDuplicateGuidsOnStartup === "boolean") {
+      supportedSettings.scanDuplicateGuidsOnStartup = savedSettings.scanDuplicateGuidsOnStartup;
+    }
+    if (typeof savedSettings.mergePairedFolderNotes === "boolean") {
+      supportedSettings.mergePairedFolderNotes = savedSettings.mergePairedFolderNotes;
+    }
     const orderByFolder = (saved == null ? void 0 : saved.orderByFolder) && typeof saved.orderByFolder === "object" ? saved.orderByFolder : {};
-    Object.keys(orderByFolder).forEach((key) => {
-      if (!Array.isArray(orderByFolder[key])) orderByFolder[key] = [];
+    Object.keys(orderByFolder).forEach((key2) => {
+      if (!Array.isArray(orderByFolder[key2])) orderByFolder[key2] = [];
     });
     return {
-      version: 1,
+      version: 2,
       settings: { ...DEFAULT_SETTINGS, ...supportedSettings },
       orderByFolder,
       folderGuids: (saved == null ? void 0 : saved.folderGuids) && typeof saved.folderGuids === "object" ? saved.folderGuids : {},
-      fileGuids: (saved == null ? void 0 : saved.fileGuids) && typeof saved.fileGuids === "object" ? saved.fileGuids : {}
+      fileGuids: (saved == null ? void 0 : saved.fileGuids) && typeof saved.fileGuids === "object" ? saved.fileGuids : {},
+      detachedFolderNotes: (saved == null ? void 0 : saved.detachedFolderNotes) && typeof saved.detachedFolderNotes === "object" ? saved.detachedFolderNotes : {},
+      consumedManifestIds: Array.isArray(saved == null ? void 0 : saved.consumedManifestIds) ? saved.consumedManifestIds.filter((id) => typeof id === "string") : [],
+      guidBackups: Array.isArray(saved == null ? void 0 : saved.guidBackups) ? saved.guidBackups : [],
+      legacyGuidField: typeof rawSettings.orderFrontmatterKey === "string" && rawSettings.orderFrontmatterKey.trim() && rawSettings.orderFrontmatterKey.trim() !== GUID_FRONTMATTER_KEY ? rawSettings.orderFrontmatterKey.trim() : void 0,
+      folderNoteMergeOverrides: (saved == null ? void 0 : saved.folderNoteMergeOverrides) && typeof saved.folderNoteMergeOverrides === "object" ? saved.folderNoteMergeOverrides : {},
+      transferReceipts: (saved == null ? void 0 : saved.transferReceipts) || {}
     };
   }
   queueSave(force = false) {
@@ -441,7 +1159,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   }
   enqueueDirtySave() {
     this.savePromise = this.savePromise.catch((error) => {
-      console.error("[Yuque Order Drag] Previous data save failed; retrying.", error);
+      console.error("[Yuque Sorting] Previous data save failed; retrying.", error);
     }).then(async () => {
       while (this.saveDirty) {
         this.saveDirty = false;
@@ -449,7 +1167,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
           await this.saveData(this.data);
         } catch (error) {
           this.saveDirty = true;
-          console.error("[Yuque Order Drag] Failed to save plugin data.", error);
+          console.error("[Yuque Sorting] Failed to save plugin data.", error);
           break;
         }
       }
@@ -473,9 +1191,14 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     await this.enqueueDirtySave();
   }
   async saveSettings() {
+    if (this.autoCopyPreparing && this.transferInProgress) {
+      new import_obsidian.Notice("\u81EA\u52A8\u590D\u5236\u671F\u95F4\u6682\u4E0D\u4FDD\u5B58\u8BBE\u7F6E\uFF0C\u8BF7\u5B8C\u6210\u540E\u518D\u4FEE\u6539");
+      return;
+    }
     await this.forceSave();
   }
   async reconcileVault(forceRefresh) {
+    if (this.transferInProgress) return;
     const all = this.app.vault.getAllLoadedFiles();
     const files = all.filter((file) => file instanceof import_obsidian.TFile);
     const folders = all.filter((file) => file instanceof import_obsidian.TFolder);
@@ -490,10 +1213,10 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     const sortable = folder.children.filter((child) => child instanceof import_obsidian.TFile || child instanceof import_obsidian.TFolder);
     const childGuids = sortable.map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
     const uniqueChildGuids = [...new Set(childGuids)];
-    const key = this.folderKeySync(folder);
-    const previous = this.data.orderByFolder[key] || [];
+    const key2 = this.folderKeySync(folder);
+    const previous = this.data.orderByFolder[key2] || [];
     const byName = sortable.slice().sort((a, b) => a.name.localeCompare(b.name, void 0, { numeric: true, sensitivity: "base" })).map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
-    this.data.orderByFolder[key] = reconcileOrderNonDestructive(
+    this.data.orderByFolder[key2] = reconcileOrderNonDestructive(
       previous,
       uniqueChildGuids,
       byName,
@@ -504,7 +1227,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     const cached = this.guidByPath.get(file.path);
     if (cached) return cached;
     if (!isMarkdown(file)) {
-      const guid = this.data.fileGuids[file.path] || createGuid("obs-file");
+      const guid = this.data.fileGuids[file.path] || createGuid("f", this.data.settings.guidBits);
       this.data.fileGuids[file.path] = guid;
       this.guidByPath.set(file.path, guid);
       return guid;
@@ -522,7 +1245,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
         }
       }
       if (!guid) {
-        guid = createGuid("obs");
+        guid = createGuid("f", this.data.settings.guidBits);
         await this.writeFileGuid(file, guid);
       }
       this.guidByPath.set(file.path, guid);
@@ -536,53 +1259,94 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     }
   }
   readCachedFrontmatterGuid(file) {
-    var _a, _b;
-    const value = (_b = (_a = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter) == null ? void 0 : _b[this.data.settings.orderFrontmatterKey];
-    return normalizeGuid(value);
+    var _a;
+    const frontmatter = (_a = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter;
+    return normalizeGuid(frontmatter == null ? void 0 : frontmatter[GUID_FRONTMATTER_KEY]) || normalizeGuid(this.data.legacyGuidField ? frontmatter == null ? void 0 : frontmatter[this.data.legacyGuidField] : null);
   }
   readGuidFromText(text) {
     var _a;
     const match = String(text).match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
     if (!match) return null;
-    const key = this.data.settings.orderFrontmatterKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const field = match[1].match(new RegExp(`^\\s*${key}\\s*:\\s*(.*?)\\s*$`, "m"));
-    return normalizeGuid((_a = field == null ? void 0 : field[1]) == null ? void 0 : _a.replace(/^['\"]|['\"]$/g, ""));
+    const keys = [GUID_FRONTMATTER_KEY, this.data.legacyGuidField].filter((key2) => Boolean(key2));
+    for (const key2 of keys) {
+      const escaped = key2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const field = match[1].match(new RegExp(`^\\s*${escaped}\\s*:\\s*(.*?)\\s*$`, "m"));
+      const guid = normalizeGuid((_a = field == null ? void 0 : field[1]) == null ? void 0 : _a.replace(/^['\"]|['\"]$/g, ""));
+      if (guid) return guid;
+    }
+    return null;
   }
   async writeFileGuid(file, guid) {
-    const key = this.data.settings.orderFrontmatterKey;
+    const key2 = GUID_FRONTMATTER_KEY;
     try {
       await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-        if (!normalizeGuid(frontmatter[key])) frontmatter[key] = guid;
+        if (!normalizeGuid(frontmatter[key2])) frontmatter[key2] = guid;
       });
       return;
     } catch (e) {
       await this.app.vault.process(file, (text) => {
         if (this.readGuidFromText(text)) return text;
         return `---
-${key}: ${guid}
+${key2}: ${guid}
 ---
 
 ${text}`;
       });
     }
   }
-  async ensureFolderGuid(folder) {
-    var _a;
-    if (!folder.path) return null;
-    const ownNote = this.app.vault.getAbstractFileByPath(`${folder.path}/${basename(folder.path)}.md`);
-    const siblingNotePath = `${((_a = folder.parent) == null ? void 0 : _a.path) ? `${folder.parent.path}/` : ""}${basename(folder.path)}.md`;
-    const siblingNote = this.app.vault.getAbstractFileByPath(siblingNotePath);
-    const folderNote = isMarkdown(ownNote) ? ownNote : siblingNote;
-    if (folderNote instanceof import_obsidian.TFile && isMarkdown(folderNote)) {
-      const guid = await this.ensureFileGuid(folderNote);
-      const previousGuid = this.data.folderGuids[folder.path];
-      if (previousGuid && previousGuid !== guid) {
-        replaceGuidInOrders(this.data.orderByFolder, previousGuid, guid);
-      }
-      this.data.folderGuids[folder.path] = guid;
-      return guid;
+  async setFileGuid(file, guid) {
+    const key2 = GUID_FRONTMATTER_KEY;
+    try {
+      await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        frontmatter[key2] = guid;
+      });
+    } catch (e) {
+      await this.app.vault.process(file, (text) => {
+        const match = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+        if (!match) return `---
+${key2}: ${guid}
+---
+
+${text}`;
+        const escaped = key2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const body = match[1];
+        const nextBody = new RegExp(`^\\s*${escaped}\\s*:.*$`, "m").test(body) ? body.replace(new RegExp(`^\\s*${escaped}\\s*:.*$`, "m"), `${key2}: ${guid}`) : `${key2}: ${guid}
+${body}`;
+        return text.replace(match[0], `---
+${nextBody}
+---
+`);
+      });
     }
-    if (!this.data.folderGuids[folder.path]) this.data.folderGuids[folder.path] = createGuid("obs-folder");
+    this.guidByPath.set(file.path, guid);
+  }
+  async clearFileGuid(file, expectedGuid) {
+    try {
+      await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        if (normalizeGuid(frontmatter[GUID_FRONTMATTER_KEY]) === expectedGuid) {
+          delete frontmatter[GUID_FRONTMATTER_KEY];
+        }
+      });
+    } catch (e) {
+      await this.app.vault.process(file, (text) => {
+        const match = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+        if (!match) return text;
+        const escaped = GUID_FRONTMATTER_KEY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const line = new RegExp(`^\\s*${escaped}\\s*:\\s*['"]?${expectedGuid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}['"]?\\s*\\r?\\n?`, "m");
+        const body = match[1].replace(line, "").replace(/\s+$/, "");
+        return text.replace(match[0], body ? `---
+${body}
+---
+` : "");
+      });
+    }
+    this.guidByPath.delete(file.path);
+  }
+  async ensureFolderGuid(folder) {
+    if (!folder.path || folder.path === "/") return null;
+    if (!this.data.folderGuids[folder.path]) {
+      this.data.folderGuids[folder.path] = createGuid("d", this.data.settings.guidBits);
+    }
     return this.data.folderGuids[folder.path];
   }
   folderKeySync(folder) {
@@ -600,8 +1364,8 @@ ${text}`;
   }
   sortFolderItems(folderPath, items) {
     const folder = !folderPath || folderPath === "/" ? this.app.vault.getRoot() : this.app.vault.getAbstractFileByPath(folderPath);
-    const key = folder instanceof import_obsidian.TFolder ? this.folderKeySync(folder) : ROOT_FOLDER_KEY;
-    const saved = this.data.orderByFolder[key] || [];
+    const key2 = folder instanceof import_obsidian.TFolder ? this.folderKeySync(folder) : ROOT_FOLDER_KEY;
+    const saved = this.data.orderByFolder[key2] || [];
     const sortable = items.filter((item) => item instanceof import_obsidian.TFolder || item instanceof import_obsidian.TFile);
     return sortEntries(
       sortable,
@@ -611,6 +1375,14 @@ ${text}`;
     );
   }
   async handleCreate(file) {
+    if (this.ownsAutoCopyPath(file.path)) {
+      this.autoCopyLastEvent = Date.now();
+      return;
+    }
+    if (this.transferInProgress) {
+      this.transferEvents.push(() => this.handleCreate(file));
+      return;
+    }
     if (!this.app.workspace.layoutReady) return;
     if (file instanceof import_obsidian.TFile) {
       const guid = await this.ensureFileGuid(file);
@@ -624,15 +1396,18 @@ ${text}`;
     this.refreshExplorer();
   }
   async handleDelete(file) {
+    if (this.ownsAutoCopyPath(file.path)) {
+      this.autoCopyLastEvent = Date.now();
+      return;
+    }
+    if (this.transferInProgress) {
+      this.transferEvents.push(() => this.handleDelete(file));
+      return;
+    }
     if (!this.app.workspace.layoutReady) return;
     if (file instanceof import_obsidian.TFile) {
       const guid = this.guidByPath.get(file.path) || (isMarkdown(file) ? this.readCachedFrontmatterGuid(file) : this.data.fileGuids[file.path]);
-      const identityFolderPath = isMarkdown(file) && guid ? folderIdentityPathForNote(file.path, this.data.folderGuids, guid) : null;
-      if (guid && identityFolderPath) {
-        detachFolderNoteFromOrder(this.data.orderByFolder, guid);
-      } else if (guid) {
-        removeGuidFromOrders(this.data.orderByFolder, guid);
-      }
+      if (guid) removeGuidFromOrders(this.data.orderByFolder, guid);
       this.guidByPath.delete(file.path);
       if (!isMarkdown(file)) delete this.data.fileGuids[file.path];
     } else if (file instanceof import_obsidian.TFolder) {
@@ -662,12 +1437,46 @@ ${text}`;
     this.refreshExplorer();
   }
   async handleRename(file, oldPath) {
-    var _a, _b;
+    var _a;
+    if (this.ownsAutoCopyPath(file.path) || this.ownsAutoCopyPath(oldPath)) {
+      this.autoCopyLastEvent = Date.now();
+      return;
+    }
+    if (this.transferInProgress) {
+      this.transferEvents.push(() => this.handleRename(file, oldPath));
+      return;
+    }
     if (!this.app.workspace.layoutReady) return;
+    const renameKey = `${oldPath}
+${file.path}`;
+    const existing = this.handledRenames.get(file);
+    if ((existing == null ? void 0 : existing.key) === renameKey) return existing.done;
+    const done = this.processRename(file, oldPath);
+    this.handledRenames.set(file, { key: renameKey, done });
+    try {
+      await done;
+    } catch (error) {
+      if (((_a = this.handledRenames.get(file)) == null ? void 0 : _a.done) === done) this.handledRenames.delete(file);
+      throw error;
+    }
+  }
+  async renameTracked(file, destination) {
+    const oldPath = file.path;
+    await this.app.fileManager.renameFile(file, destination);
+    await this.handleRename(file, oldPath);
+  }
+  async processRename(file, oldPath) {
+    var _a, _b;
     if (file instanceof import_obsidian.TFolder) {
       const movedGuid = this.data.folderGuids[oldPath];
       const oldParent = parentPath(oldPath);
       migratePathMappings(this.data.folderGuids, oldPath, file.path);
+      for (const [path, guid] of Array.from(this.guidByPath)) {
+        if (path === oldPath || path.startsWith(`${oldPath}/`)) {
+          this.guidByPath.delete(path);
+          this.guidByPath.set(`${file.path}${path.slice(oldPath.length)}`, guid);
+        }
+      }
       const fileUpdates = migratePathMappings(this.data.fileGuids, oldPath, file.path);
       fileUpdates.forEach(([from, to, guid]) => {
         this.guidByPath.delete(from);
@@ -706,12 +1515,9 @@ ${text}`;
         const newParent = ((_b = file.parent) == null ? void 0 : _b.path) || "";
         if (oldParent !== newParent) {
           if (file.parent) await this.ensureFolderGuid(file.parent);
-          const becameFolderNote = file.parent && file.basename === file.parent.name && this.data.folderGuids[file.parent.path] === guid;
           const undoPosition = this.pendingUndoPositions.get(guid);
           const pending = this.pendingDropPlacements.get(guid);
-          if (becameFolderNote) {
-            detachFolderNoteFromOrder(this.data.orderByFolder, guid);
-          } else if (undoPosition && undoPosition.folderKey === this.folderKeySync(file.parent)) {
+          if (undoPosition && undoPosition.folderKey === this.folderKeySync(file.parent)) {
             this.pendingUndoPositions.delete(guid);
             this.restoreStoredGuidPosition(undoPosition);
           } else if ((pending == null ? void 0 : pending.parentPath) === newParent) {
@@ -728,14 +1534,14 @@ ${text}`;
     this.refreshExplorer();
   }
   addGuidToFolder(folder, guid) {
-    const key = this.folderKeySync(folder);
-    const order = this.data.orderByFolder[key] || [];
-    this.data.orderByFolder[key] = insertGuid(order, guid, this.data.settings.newItemPlacement);
+    const key2 = this.folderKeySync(folder);
+    const order = this.data.orderByFolder[key2] || [];
+    this.data.orderByFolder[key2] = insertGuid(order, guid, this.data.settings.newItemPlacement);
   }
   placeGuidRelative(folder, guid, targetGuid, before) {
-    const key = this.folderKeySync(folder);
-    relocateGuid(this.data.orderByFolder, key, guid, this.data.settings.newItemPlacement);
-    this.data.orderByFolder[key] = moveGuid(this.data.orderByFolder[key], guid, targetGuid, before);
+    const key2 = this.folderKeySync(folder);
+    relocateGuid(this.data.orderByFolder, key2, guid, this.data.settings.newItemPlacement);
+    this.data.orderByFolder[key2] = moveGuid(this.data.orderByFolder[key2], guid, targetGuid, before);
   }
   captureItemPosition(item, guid) {
     var _a, _b;
@@ -752,24 +1558,1038 @@ ${text}`;
       position
     );
   }
+  collectIdentityState() {
+    const entries = [];
+    const folderChildrenByPath = {};
+    const visit = (folder) => {
+      const children = this.sortFolderItems(folder.path, folder.children.filter((item) => item instanceof import_obsidian.TFile || item instanceof import_obsidian.TFolder));
+      folderChildrenByPath[folder.path] = children.map((item) => item.path);
+      for (const item of children) {
+        const guid = this.getItemGuidSync(item);
+        if (guid) entries.push({ path: item.path, kind: item instanceof import_obsidian.TFolder ? "folder" : "file", guid });
+        if (item instanceof import_obsidian.TFolder) visit(item);
+      }
+    };
+    visit(this.app.vault.getRoot());
+    return { entries, folderChildrenByPath };
+  }
+  rebuildOrders(folderChildrenByPath) {
+    const guidByPath = /* @__PURE__ */ new Map();
+    const folderGuidByPath = /* @__PURE__ */ new Map();
+    for (const item of this.app.vault.getAllLoadedFiles()) {
+      const guid = this.getItemGuidSync(item);
+      if (guid) guidByPath.set(item.path, guid);
+      if (item instanceof import_obsidian.TFolder && item.path && guid) folderGuidByPath.set(item.path, guid);
+    }
+    this.data.orderByFolder = remapOrderSnapshot(folderChildrenByPath, guidByPath, folderGuidByPath);
+  }
+  clearUndoHistory() {
+    this.dragUndoStack = [];
+    this.lastDragUndo = null;
+  }
+  async readItemGuid(item) {
+    let guid = this.getItemGuidSync(item);
+    if (!guid && item instanceof import_obsidian.TFile && isMarkdown(item)) {
+      try {
+        guid = this.readGuidFromText(await this.app.vault.read(item));
+      } catch (e) {
+        guid = null;
+      }
+    }
+    return guid;
+  }
+  manageableItems() {
+    return this.app.vault.getAllLoadedFiles().filter((item) => (item instanceof import_obsidian.TFile || item instanceof import_obsidian.TFolder) && Boolean(item.path) && item.path !== "/");
+  }
+  async collectUnmanagedItems() {
+    const items = this.manageableItems();
+    const managed = new Array(items.length).fill(false);
+    await mapLimit(items.map((item, index) => ({ item, index })), 4, async ({ item, index }) => {
+      managed[index] = Boolean(await this.readItemGuid(item));
+    });
+    return items.filter((_item, index) => !managed[index]);
+  }
+  collectUnindexedItems() {
+    const membership = /* @__PURE__ */ new Map();
+    return this.manageableItems().filter((item) => {
+      const guid = this.getItemGuidSync(item);
+      if (!guid) return false;
+      const key2 = this.folderKeySync(item.parent);
+      let indexed = membership.get(key2);
+      if (!indexed) {
+        indexed = new Set(this.data.orderByFolder[key2] || []);
+        membership.set(key2, indexed);
+      }
+      return !indexed.has(guid);
+    });
+  }
+  async auditAndOfferManagement() {
+    if (this.identityMaintenanceInProgress) return;
+    const unmanaged = await this.collectUnmanagedItems();
+    if (!unmanaged.length) {
+      new import_obsidian.Notice("\u5F53\u524D Vault \u4E2D\u6CA1\u6709\u672A\u7BA1\u7406\u9879\u76EE\uFF1B\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u5DF2\u7531\u63D2\u4EF6\u5B9E\u65F6\u81EA\u52A8\u7EB3\u5165");
+      return;
+    }
+    const fileCount = unmanaged.filter((item) => item instanceof import_obsidian.TFile).length;
+    const proceed = await new Promise((resolve) => new ConfirmActionModal(
+      this.app,
+      "\u68C0\u6D4B\u5230\u672A\u7BA1\u7406\u9879\u76EE",
+      `\u53D1\u73B0 ${fileCount} \u4E2A\u6587\u4EF6\u548C ${unmanaged.length - fileCount} \u4E2A\u6587\u4EF6\u5939\u3002\u5C06\u53EA\u4E3A\u7F3A\u5931\u8EAB\u4EFD\u7684\u9879\u76EE\u751F\u6210 GUID\uFF0C\u5E76\u6309\u65B0\u589E\u9879\u89C4\u5219\u7EB3\u5165\u7BA1\u7406\uFF1B\u5DF2\u6709\u5144\u5F1F\u9879\u76F8\u5BF9\u987A\u5E8F\u4E0D\u53D8\u3002`,
+      "\u751F\u6210 GUID \u5E76\u7EB3\u5165\u7BA1\u7406",
+      resolve
+    ).open());
+    if (proceed) await this.applyIdentitySelection(unmanaged.map((item) => item.path), "missing");
+  }
+  async takeOverHistoricalVault() {
+    if (this.identityMaintenanceInProgress) return;
+    const unmanaged = await this.collectUnmanagedItems();
+    const unindexed = this.collectUnindexedItems();
+    if (!unmanaged.length && !unindexed.length) {
+      new import_obsidian.Notice("\u5F53\u524D Vault \u7684\u8EAB\u4EFD\u548C\u76EE\u5F55\u7D22\u5F15\u5747\u5B8C\u6574\uFF1B\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u5DF2\u88AB\u5B9E\u65F6\u81EA\u52A8\u63A5\u7BA1");
+      return;
+    }
+    const currentOrder = this.collectIdentityState().folderChildrenByPath;
+    const proceed = await new Promise((resolve) => new ConfirmActionModal(
+      this.app,
+      "\u63A5\u7BA1\u5386\u53F2 Obsidian Vault",
+      `\u53D1\u73B0 ${unmanaged.length} \u4E2A\u9879\u76EE\u7F3A\u5C11 GUID\u3001${unindexed.length} \u4E2A\u9879\u76EE\u7F3A\u5C11\u76EE\u5F55\u7D22\u5F15\u3002${unindexed.length ? `\u7F3A\u5C11\u7D22\u5F15\uFF1A${unindexed.slice(0, 10).map((item) => item.path).join("\uFF1B")}${unindexed.length > 10 ? `\uFF1B\u53E6\u6709 ${unindexed.length - 10} \u9879` : ""}\u3002` : ""}\u5C06\u8865\u5168\u8EAB\u4EFD\uFF0C\u5E76\u4EE5\u5F53\u524D\u663E\u793A\u7ED3\u6784\u4E00\u6B21\u6027\u91CD\u5EFA\u76EE\u5F55\u7D22\u5F15\uFF1B\u4E0D\u4F1A\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u6587\u4EF6\u3002`,
+      "\u5F00\u59CB\u63A5\u7BA1",
+      resolve
+    ).open());
+    if (proceed) await this.applyIdentitySelection(
+      unmanaged.map((item) => item.path),
+      "missing",
+      currentOrder,
+      "\u5386\u53F2 Vault \u63A5\u7BA1\u5B8C\u6210"
+    );
+  }
+  ownsAutoCopyPath(path) {
+    if (this.autoCopyCreatedDirectories.has(path)) return true;
+    const scope = this.autoCopyScope;
+    if (!scope) return false;
+    const prefix = scope.destination ? `${scope.destination}/` : "";
+    if (!path.startsWith(prefix)) return false;
+    return scope.roots.has(path.slice(prefix.length).split("/")[0]);
+  }
+  openLocalCopy() {
+    if (this.identityMaintenanceInProgress || this.autoCopyPreparing) {
+      new import_obsidian.Notice("\u5DF2\u6709\u7EF4\u62A4\u6216\u590D\u5236\u4EFB\u52A1\u6B63\u5728\u8FDB\u884C");
+      return;
+    }
+    const modal = new import_obsidian.Modal(this.app);
+    modal.setTitle("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09");
+    modal.contentEl.addClass("yq-copy-modal");
+    modal.contentEl.createEl("p", { text: "\u652F\u6301\u590D\u5236\u6E90\u5E93\u6216\u6E90\u5E93\u6307\u5B9A\u76EE\u5F55\u4E0B\u7684\u6587\u4EF6\u548C\u6587\u4EF6\u5939\uFF0C\u4E0D\u590D\u5236\u6240\u9009\u6E90\u76EE\u5F55\u672C\u8EAB\u3002\u8BFB\u53D6\u6E90\u5E93 .obsidian \u4E2D\u7684\u672C\u63D2\u4EF6\u6392\u5E8F\uFF1B\u6CA1\u6709\u7D22\u5F15\u65F6\u6309\u540D\u79F0\u6392\u5E8F\u5E76\u5728\u786E\u8BA4\u9875\u63D0\u793A\u3002\u9690\u85CF\u9879\u76EE\u4E0D\u590D\u5236\uFF0C\u6E90\u5E93\u5185\u5BB9\u548C\u987A\u5E8F\u4E0D\u4FEE\u6539\u3002" });
+    let source = "", destination = "";
+    const pathRow = (name, target) => {
+      let input;
+      new import_obsidian.Setting(modal.contentEl).setName(name).setDesc(target ? "\u4EC5\u9650\u5F53\u524D\u5E93\u5185\u3002\u7559\u7A7A\u4E3A Vault \u6839\u76EE\u5F55\uFF1B\u4E5F\u53EF\u586B\u5199\u5E93\u5185\u76F8\u5BF9\u8DEF\u5F84\u3002\u4E0D\u5B58\u5728\u7684\u76EE\u5F55\u5728\u6700\u7EC8\u786E\u8BA4\u540E\u81EA\u52A8\u521B\u5EFA\u3002" : "\u9009\u62E9\u76EE\u5F55\uFF0C\u6216\u624B\u52A8\u586B\u5199\u6E90\u5E93/\u6E90\u76EE\u5F55\u7684\u7EDD\u5BF9\u8DEF\u5F84\u3002").addText((text) => {
+        input = text;
+        text.setPlaceholder(target ? "\u7559\u7A7A\u4E3A Vault \u6839\u76EE\u5F55" : "\u9009\u62E9\u76EE\u5F55\u6216\u586B\u5199\u7EDD\u5BF9\u8DEF\u5F84").onChange((value) => {
+          if (target) destination = value.trim();
+          else source = value.trim();
+        });
+      }).addButton((button) => button.setButtonText("\u9009\u62E9\u76EE\u5F55\u2026").onClick(async () => {
+        var _a, _b;
+        button.setDisabled(true);
+        try {
+          const load = window.require;
+          if (typeof load !== "function") throw new Error("\u76EE\u5F55\u9009\u62E9\u4EC5\u652F\u6301\u684C\u9762\u7AEF");
+          const base = ((_b = (_a = this.app.vault.adapter).getBasePath) == null ? void 0 : _b.call(_a)) || "";
+          const selected = await chooseDirectory(load, name, target ? base : source);
+          if (!selected) return;
+          if (target) {
+            await resolveCopyDestination({ fs: load("fs"), path: load("path") }, base, selected);
+            destination = selected;
+          } else source = selected;
+          input.setValue(selected);
+        } catch (error) {
+          new import_obsidian.Notice(String(error));
+        } finally {
+          button.setDisabled(false);
+        }
+      }));
+    };
+    pathRow("\u6E90\u5E93\u6216\u6E90\u5E93\u6307\u5B9A\u76EE\u5F55", false);
+    pathRow("\u5F53\u524D\u5E93\u6216\u8005\u5F53\u524D\u5E93\u7684\u76EE\u5F55", true);
+    new import_obsidian.Setting(modal.contentEl).addButton((button) => button.setButtonText("\u9884\u68C0\u5E76\u5904\u7406\u51B2\u7A81").setCta().onClick(() => {
+      modal.close();
+      void this.copyLocalDirectory(source, destination).catch((error) => new import_obsidian.Notice(`\u81EA\u52A8\u590D\u5236\u672A\u5B8C\u6210\uFF1A${String(error)}`, 12e3));
+    }));
+    modal.open();
+  }
+  async copyLocalDirectory(sourceInput, destination) {
+    if (this.identityMaintenanceInProgress || this.autoCopyPreparing || !this.app.workspace.layoutReady) return;
+    const load = window.require;
+    const adapter = this.app.vault.adapter;
+    if (typeof load !== "function" || typeof adapter.getBasePath !== "function") throw new Error("\u8DE8Vault\u5408\u5E76\u4EC5\u652F\u6301\u672C\u673A\u684C\u9762 Vault");
+    const io = { fs: load("fs"), path: load("path") };
+    this.autoCopyPreparing = true;
+    this.autoCopyCancelled = false;
+    const checkCancelled = () => {
+      if (this.autoCopyCancelled) throw new Error("\u81EA\u52A8\u590D\u5236\u5DF2\u53D6\u6D88");
+    };
+    try {
+      const source = await checkedDirectory(io, sourceInput);
+      const vaultRoot = await checkedDirectory(io, adapter.getBasePath());
+      if (contained(io, vaultRoot, source) || contained(io, source, vaultRoot)) throw new Error("\u6765\u6E90\u548C\u5F53\u524D Vault \u4E0D\u80FD\u76F8\u540C\u3001\u4E92\u76F8\u5305\u542B\u6216\u6765\u81EA\u5F53\u524D Vault \u5185\u90E8");
+      const targetPlan = await resolveCopyDestination(io, vaultRoot, destination);
+      destination = targetPlan.relative;
+      const target = targetPlan.absolute;
+      const targetFolder = targetPlan.missing.length ? null : this.transferFolder(destination);
+      const sourceEntries = await scanDisk(io, source);
+      const sourceInfo = await sourceTransfer(
+        io,
+        source,
+        sourceEntries,
+        this.manifest.id,
+        (kind, used) => createGuid(kind, this.data.settings.guidBits, used),
+        import_obsidian.parseYaml
+      );
+      const pack = sourceInfo.pack;
+      checkCancelled();
+      if (!pack.items.length) {
+        new import_obsidian.Notice("\u6765\u6E90\u6CA1\u6709\u53EF\u590D\u5236\u7684\u975E\u9690\u85CF\u9879\u76EE");
+        return;
+      }
+      const targetNames = targetPlan.missing.length ? [] : await io.fs.promises.readdir(target);
+      const targetNameSet = new Set(targetNames);
+      const indexedNames = new Set((targetFolder == null ? void 0 : targetFolder.children.map((item) => item.name)) || []);
+      if (targetNames.some((name) => !name.startsWith(".") && !indexedNames.has(name))) throw new Error("\u76EE\u6807\u76EE\u5F55\u8FD8\u6709\u672A\u88AB Obsidian \u7D22\u5F15\u7684\u9879\u76EE\uFF0C\u8BF7\u7B49\u5F85\u7D22\u5F15\u5B8C\u6210\u540E\u91CD\u8BD5");
+      const nameKey = (name) => name.normalize("NFC").toLowerCase();
+      const existingKeys = new Set(targetNames.map(nameKey));
+      const conflicts = pack.orders[""].filter((name) => existingKeys.has(nameKey(name)));
+      const choices = conflicts.length ? await new Promise((resolve) => new CopyConflictModal(this.app, conflicts, resolve).open()) : /* @__PURE__ */ new Map();
+      if (!choices) return;
+      const roots = planCopyRoots(pack.orders[""], targetNames, choices);
+      const mappedPaths = copyPathMap(pack, roots);
+      const prefix = destination ? `${destination}/` : "";
+      const replacedRoots = new Set(roots.filter((root) => root.replaces).map((root) => root.target));
+      const inReplacement = (path) => path.startsWith(prefix) && replacedRoots.has(path.slice(prefix.length).split("/")[0]);
+      const snapshots = /* @__PURE__ */ new Map();
+      let removedCount = 0;
+      for (const root of roots.filter((root2) => root2.replaces)) {
+        const snapshot = await scanDisk(io, io.path.join(target, root.target), true);
+        snapshots.set(root.target, snapshot);
+        removedCount += snapshot.length;
+      }
+      const all = this.manageableItems();
+      const oldGuids = /* @__PURE__ */ new Map();
+      const occupied = /* @__PURE__ */ new Set();
+      for (const item of all) {
+        let guid = this.getItemGuidSync(item);
+        if (item instanceof import_obsidian.TFile && isMarkdown(item)) {
+          const header = await markdownHeader(io, io.path.join(vaultRoot, item.path));
+          const yaml = header.yaml === null ? {} : yamlObject((0, import_obsidian.parseYaml)(header.yaml));
+          guid = normalizeGuid(yaml.guid) || normalizeGuid(this.data.legacyGuidField ? yaml[this.data.legacyGuidField] : null);
+        }
+        if (!guid) throw new Error(`\u5F53\u524D\u5E93\u9879\u76EE\u5C1A\u65E0 GUID\uFF0C\u8BF7\u5148\u68C0\u6D4B\u5E76\u7EB3\u5165\u7BA1\u7406\uFF1A${item.path}`);
+        oldGuids.set(item.path, guid);
+        occupied.add(guid);
+      }
+      for (const mappings of [this.data.folderGuids, this.data.fileGuids]) for (const guid of Object.values(mappings)) occupied.add(guid);
+      const replacements = planTransferGuids(pack.items, occupied, (kind, used) => createGuid(kind, this.data.settings.guidBits, used));
+      const remapped = pack.items.filter((item) => replacements.get(item.path) !== item.guid).length;
+      const targetOrder = targetFolder ? this.sortFolderItems(targetFolder.path, targetFolder.children).map((item) => item.path) : [];
+      const originalData = this.data;
+      const dataSnapshot = JSON.stringify(originalData);
+      const missingGuids = /* @__PURE__ */ new Map();
+      const reservedGuids = /* @__PURE__ */ new Set([...occupied, ...replacements.values()]);
+      for (const path of targetPlan.missing) missingGuids.set(path, createGuid("d", this.data.settings.guidBits, reservedGuids));
+      const confirm = await new Promise((resolve) => new ConfirmActionModal(
+        this.app,
+        targetPlan.missing.length ? `\u786E\u8BA4\u81EA\u52A8\u590D\u5236\uFF1A\u5C06\u521B\u5EFA ${targetPlan.missing.join("\u3001")}` : "\u786E\u8BA4\u81EA\u52A8\u590D\u5236",
+        `\u6765\u6E90\uFF1A${source}\uFF1B\u76EE\u6807\uFF1A${destination || "Vault \u6839\u76EE\u5F55"}\u3002\u590D\u5236 ${pack.items.length} \u9879\uFF0C${remapped} \u4E2A\u51B2\u7A81\u6216\u91CD\u590D GUID \u6362\u53F7\uFF0C${sourceInfo.generated} \u9879\u8865\u8EAB\u4EFD\uFF0C${sourceInfo.fallback} \u9879\u65E0\u6765\u6E90\u7D22\u5F15\u3001\u6309\u540D\u79F0\u515C\u5E95\u3002${replacedRoots.size} \u4E2A\u540C\u540D\u9879\u5C06\u6574\u9879\u66FF\u6362\uFF0C\u76EE\u6807\u539F ${removedCount} \u9879\uFF08\u542B\u76EE\u6807\u72EC\u6709\u5B50\u9879\uFF09\u79FB\u5165\u5907\u4EFD\uFF0C\u4E0D\u9012\u5F52\u6DF7\u5408\u3002\u8BA1\u5212\uFF1A${roots.slice(0, 30).map((root) => `${root.source} \u2192 ${root.target}${root.replaces ? " [\u6574\u9879\u66FF\u6362]" : ""}`).join("\uFF1B")}${roots.length > 30 ? "\uFF1B\u5176\u4F59\u7701\u7565" : ""}\u3002\u66FF\u6362\u9879\u6CBF\u7528\u539F\u4F4D\u7F6E\uFF0C\u65B0\u9879\u6309\u65B0\u589E\u4F4D\u7F6E\u8BBE\u7F6E\u63D2\u5165\uFF0C\u5176\u4ED6\u5144\u5F1F\u9879\u987A\u5E8F\u4E0D\u53D8\u3002\u91CD\u547D\u540D\u53EF\u80FD\u5F71\u54CD\u76F8\u5BF9\u94FE\u63A5\uFF0C\u4E0D\u81EA\u52A8\u6539\u5199\u6B63\u6587\u94FE\u63A5\u3002\u8BF7\u5148\u5173\u95ED\u88AB\u66FF\u6362\u7684\u7B14\u8BB0\uFF0C\u5E76\u6682\u505C\u540C\u6B65\u6216\u5176\u4ED6\u7F16\u8F91\u3002`,
+        "\u786E\u8BA4\u590D\u5236\uFF08\u66FF\u6362\u9879\u5DF2\u5907\u4EFD\u540E\u624D\u6267\u884C\uFF09",
+        resolve
+      ).open());
+      if (!confirm) return;
+      checkCancelled();
+      if (this.identityMaintenanceInProgress || this.data !== originalData || JSON.stringify(this.data) !== dataSnapshot) throw new Error("\u9884\u68C0\u540E\u8EAB\u4EFD\u6216\u6392\u5E8F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        var _a, _b;
+        const path = (_b = (_a = leaf.view) == null ? void 0 : _a.file) == null ? void 0 : _b.path;
+        if (path && inReplacement(path)) throw new Error(`\u8BF7\u5148\u5173\u95ED\u88AB\u66FF\u6362\u7684\u5DF2\u6253\u5F00\u6587\u4EF6\uFF1A${path}`);
+      });
+      this.identityMaintenanceInProgress = true;
+      this.transferInProgress = true;
+      let workspace = "";
+      let copyComplete = false;
+      const createdPaths = [];
+      const removeCreatedEmptyFolders = async () => {
+        for (const path of createdPaths.slice().reverse()) {
+          try {
+            await io.fs.promises.rmdir(io.path.join(vaultRoot, path));
+          } catch (error) {
+            if (error.code !== "ENOENT") throw new Error(`\u65B0\u5EFA\u76EE\u5F55\u542B\u5176\u4ED6\u5185\u5BB9\u6216\u65E0\u6CD5\u79FB\u9664\uFF0C\u5DF2\u4FDD\u7559\uFF1A${path}`);
+          }
+        }
+      };
+      try {
+        await this.flushSave();
+        if (this.saveDirty) throw new Error("\u73B0\u6709\u63D2\u4EF6\u6570\u636E\u4FDD\u5B58\u5931\u8D25\uFF0C\u505C\u6B62\u590D\u5236");
+        const backupBase = io.path.join(vaultRoot, this.app.vault.configDir, "plugins", this.manifest.id);
+        const checkedBase = await checkedDirectory(io, backupBase);
+        if (!contained(io, vaultRoot, checkedBase)) throw new Error("\u63D2\u4EF6\u5907\u4EFD\u76EE\u5F55\u4E0D\u5728\u5F53\u524D Vault \u5185");
+        workspace = await io.fs.promises.mkdtemp(io.path.join(checkedBase, "local-copy-"));
+        await io.fs.promises.writeFile(io.path.join(workspace, "data-before.json"), dataSnapshot, { flag: "wx" });
+        await io.fs.promises.writeFile(io.path.join(workspace, "plan.json"), JSON.stringify({ source, target, roots, createdDirectories: targetPlan.missing, paths: [...mappedPaths], guids: [...replacements] }), { flag: "wx" });
+        const staging = io.path.join(workspace, "staged");
+        await io.fs.promises.mkdir(staging);
+        new import_obsidian.Notice("\u6B63\u5728\u51C6\u5907\u526F\u672C\uFF0C\u5C1A\u672A\u66FF\u6362\u76EE\u6807\uFF1B\u5927\u6587\u4EF6\u9010\u9879\u590D\u5236\uFF0C\u8BF7\u52FF\u7F16\u8F91\u6765\u6E90\u6216\u76EE\u6807");
+        for (const entry of pack.items) {
+          checkCancelled();
+          const output = io.path.join(staging, mappedPaths.get(entry.path));
+          if (entry.kind === "folder") await io.fs.promises.mkdir(output, { recursive: true });
+          else {
+            await io.fs.promises.mkdir(io.path.dirname(output), { recursive: true });
+            const input = io.path.join(source, entry.path);
+            if (/\.md$/i.test(entry.path)) {
+              const header = await markdownHeader(io, input);
+              const yaml = header.yaml === null ? {} : yamlObject((0, import_obsidian.parseYaml)(header.yaml));
+              yaml.guid = replacements.get(entry.path);
+              await copyMarkdown(io, input, output, (0, import_obsidian.stringifyYaml)(yaml), header);
+            } else await io.fs.promises.copyFile(input, output, io.fs.constants.COPYFILE_EXCL);
+          }
+        }
+        const stagedInventory = await scanDisk(io, staging);
+        const verify = async () => {
+          checkCancelled();
+          if (this.transferEvents.length || JSON.stringify(this.data) !== dataSnapshot) throw new Error("\u51C6\u5907\u671F\u95F4\u76EE\u6807\u5E93\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+          await checkedDirectory(io, source);
+          await checkedDirectory(io, target);
+          await verifyDisk(io, source, sourceEntries);
+          if (sourceInfo.metadataPath && await io.fs.promises.readFile(sourceInfo.metadataPath, "utf8") !== sourceInfo.metadataText) throw new Error("\u6765\u6E90\u6392\u5E8F\u6570\u636E\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+          const currentNames = await io.fs.promises.readdir(target);
+          if (currentNames.length !== targetNames.length || currentNames.some((name) => !targetNameSet.has(name))) throw new Error("\u76EE\u6807\u540C\u7EA7\u9879\u76EE\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+          for (const [name, snapshot] of snapshots) await verifyDisk(io, io.path.join(target, name), snapshot, true);
+        };
+        const stagedData = {
+          ...originalData,
+          folderGuids: { ...originalData.folderGuids },
+          fileGuids: { ...originalData.fileGuids },
+          orderByFolder: { ...originalData.orderByFolder },
+          folderNoteMergeOverrides: { ...originalData.folderNoteMergeOverrides }
+        };
+        for (const [path, guid] of missingGuids) {
+          stagedData.folderGuids[path] = guid;
+          const parent = path.split("/").slice(0, -1).join("/");
+          const parentGuid = missingGuids.get(parent);
+          const folder = parentGuid ? null : this.transferFolder(parent);
+          const key2 = parentGuid || this.folderKeySync(folder);
+          const before = folder ? this.sortFolderItems(folder.path, folder.children).map((item) => oldGuids.get(item.path)) : [];
+          stagedData.orderByFolder[key2] = this.data.settings.newItemPlacement === "top" ? [guid, ...before] : [...before, guid];
+        }
+        const outsideGuids = /* @__PURE__ */ new Set();
+        for (const [path, guid] of oldGuids) if (!inReplacement(path)) outsideGuids.add(guid);
+        for (const path of Object.keys(stagedData.folderGuids)) if (inReplacement(path)) {
+          const guid = stagedData.folderGuids[path];
+          delete stagedData.folderGuids[path];
+          if (!outsideGuids.has(guid)) delete stagedData.orderByFolder[guid];
+        }
+        for (const path of Object.keys(stagedData.fileGuids)) if (inReplacement(path)) delete stagedData.fileGuids[path];
+        for (const entry of pack.items) {
+          const path = prefix + mappedPaths.get(entry.path);
+          const guid = replacements.get(entry.path);
+          if (entry.kind === "folder") {
+            stagedData.folderGuids[path] = guid;
+            const choice = pack.mergeChoices[entry.guid.slice(2)];
+            if (typeof choice === "boolean") stagedData.folderNoteMergeOverrides[guid.slice(2)] = choice;
+          } else if (!/\.md$/i.test(path)) stagedData.fileGuids[path] = guid;
+        }
+        for (const [parent, children] of Object.entries(pack.orders)) if (parent) stagedData.orderByFolder[replacements.get(parent)] = children.map((path) => replacements.get(path));
+        const rootByTarget = new Map(roots.map((root) => [prefix + root.target, root]));
+        const existingOrder = targetOrder.map((path) => rootByTarget.has(path) ? replacements.get(rootByTarget.get(path).source) : oldGuids.get(path));
+        const additions = roots.filter((root) => !root.replaces).map((root) => replacements.get(root.source));
+        stagedData.orderByFolder[missingGuids.get(destination) || this.folderKeySync(targetFolder)] = this.data.settings.newItemPlacement === "top" ? [...additions, ...existingOrder] : [...existingOrder, ...additions];
+        const freshTarget = await resolveCopyDestination(io, vaultRoot, target);
+        if (JSON.stringify(freshTarget.missing) !== JSON.stringify(targetPlan.missing)) throw new Error("\u9884\u68C0\u540E\u76EE\u6807\u8DEF\u5F84\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9884\u68C0");
+        for (const path of targetPlan.missing) {
+          checkCancelled();
+          this.autoCopyCreatedDirectories.add(path);
+          await io.fs.promises.mkdir(io.path.join(vaultRoot, path));
+          createdPaths.push(path);
+        }
+        await verify();
+        this.autoCopyScope = { destination, roots: new Set(roots.map((root) => root.target)) };
+        const waitForIndex = async (expected) => {
+          this.autoCopyLastEvent = Date.now();
+          const fileStats = /* @__PURE__ */ new Map();
+          for (const [path, kind] of expected) if (kind === "file") fileStats.set(path, await io.fs.promises.stat(io.path.join(vaultRoot, path)));
+          const start = Date.now();
+          let stable = 0;
+          while (Date.now() - start < 2e4) {
+            const current = this.manageableItems().filter((item) => this.ownsAutoCopyPath(item.path));
+            const matches = current.length === expected.size && current.every((item) => {
+              if (expected.get(item.path) !== (item instanceof import_obsidian.TFolder ? "folder" : "file")) return false;
+              const stat = fileStats.get(item.path);
+              return !(item instanceof import_obsidian.TFile) || Boolean(stat && item.stat.size === stat.size && Math.abs(item.stat.mtime - stat.mtimeMs) < 2);
+            });
+            stable = matches && Date.now() - this.autoCopyLastEvent >= 500 ? stable + 1 : 0;
+            if (stable >= 2) return;
+            await new Promise((resolve) => window.setTimeout(resolve, 250));
+          }
+          throw new Error("Obsidian \u6587\u4EF6\u7D22\u5F15\u672A\u53CA\u65F6\u66F4\u65B0\uFF1B\u8BF7\u91CD\u8F7D\u540E\u68C0\u67E5\u6062\u590D\u65E5\u5FD7");
+        };
+        const oldScope = new Map(all.filter((item) => this.ownsAutoCopyPath(item.path)).map((item) => [item.path, item instanceof import_obsidian.TFolder ? "folder" : "file"]));
+        await installCopies(io, {
+          roots,
+          target,
+          workspace,
+          verify,
+          checkCancelled,
+          commitData: async () => {
+            await verifyInstalledCopies(io, target, roots, stagedInventory);
+            const expected = new Map(pack.items.map((item) => [prefix + mappedPaths.get(item.path), item.kind]));
+            for (const path of createdPaths) expected.set(path, "folder");
+            await waitForIndex(expected);
+            await verifyInstalledCopies(io, target, roots, stagedInventory);
+            checkCancelled();
+            if (this.transferEvents.length || JSON.stringify(this.data) !== dataSnapshot) throw new Error("\u590D\u5236\u671F\u95F4\u5E93\u5185\u53D1\u751F\u5176\u4ED6\u6587\u4EF6\u6216\u8BBE\u7F6E\u64CD\u4F5C\uFF0C\u505C\u6B62\u63D0\u4EA4");
+            this.data = stagedData;
+            for (const path of this.guidByPath.keys()) if (this.ownsAutoCopyPath(path)) this.guidByPath.delete(path);
+            for (const entry of pack.items) this.guidByPath.set(prefix + mappedPaths.get(entry.path), replacements.get(entry.path));
+            for (const [path, guid] of missingGuids) this.guidByPath.set(path, guid);
+            await this.saveData(this.data);
+          },
+          rollbackData: async () => {
+            this.data = originalData;
+            for (const path of this.guidByPath.keys()) if (this.ownsAutoCopyPath(path)) this.guidByPath.delete(path);
+            for (const [path, guid] of oldGuids) this.guidByPath.set(path, guid);
+            await this.saveData(originalData);
+            await removeCreatedEmptyFolders();
+            await waitForIndex(oldScope);
+          }
+        });
+        copyComplete = true;
+        this.clearUndoHistory();
+        new import_obsidian.Notice(`\u5DF2\u81EA\u52A8\u590D\u5236 ${pack.items.length} \u9879\uFF1B\u539F\u5185\u5BB9\u53CA\u7D22\u5F15\u5907\u4EFD\uFF1A${workspace}`, 12e3);
+      } catch (error) {
+        throw new Error(`${String(error)}${workspace ? `\uFF1B\u51C6\u5907/\u6062\u590D\u6587\u4EF6\u4FDD\u7559\u5728 ${workspace}` : ""}`);
+      } finally {
+        if (!copyComplete) await removeCreatedEmptyFolders().catch((error) => new import_obsidian.Notice(String(error), 12e3));
+        this.autoCopyCreatedDirectories.clear();
+        this.autoCopyScope = null;
+        this.identityMaintenanceInProgress = false;
+        this.transferInProgress = false;
+        this.refreshExplorer();
+        for (const event of this.transferEvents.splice(0)) await event();
+      }
+    } finally {
+      this.autoCopyPreparing = false;
+    }
+  }
+  transferFolder(path) {
+    if (!safeTransferPath(path, true)) throw new Error("\u8BF7\u8F93\u5165 Vault \u5185\u76F8\u5BF9\u76EE\u5F55\u8DEF\u5F84\uFF0C\u4E0D\u652F\u6301\u9690\u85CF\u76EE\u5F55\u6216\u4E0A\u7EA7\u8DEF\u5F84");
+    const folder = path ? this.app.vault.getAbstractFileByPath(path) : this.app.vault.getRoot();
+    if (!(folder instanceof import_obsidian.TFolder)) throw new Error(`\u76EE\u5F55\u4E0D\u5B58\u5728\uFF1A${path}`);
+    return folder;
+  }
+  openIdentitySelection() {
+    if (this.identityMaintenanceInProgress) return;
+    new IdentitySelectionModal(this.app, this.manageableItems(), (paths, mode) => {
+      void this.applyIdentitySelection(paths, mode);
+    }).open();
+  }
+  addIdentityMenuItems(menu, item) {
+    if (!(item instanceof import_obsidian.TFile || item instanceof import_obsidian.TFolder) || !item.path) return;
+    const guid = this.getItemGuidSync(item);
+    menu.addItem((entry) => entry.setTitle(guid ? "\u91CD\u65B0\u751F\u6210 GUID \u5E76\u7EB3\u5165\u7BA1\u7406" : "\u751F\u6210 GUID \u5E76\u7EB3\u5165\u7BA1\u7406").setIcon(guid ? "refresh-cw" : "fingerprint").onClick(() => void this.applyIdentitySelection([item.path], guid ? "regenerate" : "missing")));
+    const pair = this.resolvePairedFolderNote(item);
+    if (!pair) return;
+    const merged = mergeChoice(this.data.settings.mergePairedFolderNotes, this.data.folderNoteMergeOverrides, pair.token);
+    menu.addItem((entry) => entry.setTitle(merged ? "\u53D6\u6D88\u4E0E\u540C\u540D\u6587\u4EF6\u5939\u5408\u5E76\u5C55\u793A" : "\u4E0E\u540C\u540D\u6587\u4EF6\u5939\u5408\u5E76\u5C55\u793A").setIcon(merged ? "panel-top-close" : "panel-top-open").onClick(() => void this.setPairMergeOverride(pair.token, !merged)));
+  }
+  resolvePairedFolderNote(item) {
+    let folder = null;
+    let note = null;
+    if (item instanceof import_obsidian.TFolder) {
+      folder = item;
+      const candidate = this.app.vault.getAbstractFileByPath(`${item.path}/${item.name}.md`);
+      if (candidate instanceof import_obsidian.TFile) note = candidate;
+    } else if (item instanceof import_obsidian.TFile && isMarkdown(item) && item.parent && item.basename === item.parent.name) {
+      folder = item.parent;
+      note = item;
+    }
+    if (!folder || !note) return null;
+    const token = pairedFolderNoteToken({
+      folderName: folder.name,
+      fileBasename: note.basename,
+      folderGuid: this.getItemGuidSync(folder),
+      fileGuid: this.getItemGuidSync(note),
+      directChild: note.parent === folder
+    });
+    return token ? { folder, note, token } : null;
+  }
+  isMergedPair(pair) {
+    return mergeChoice(this.data.settings.mergePairedFolderNotes, this.data.folderNoteMergeOverrides, pair.token);
+  }
+  async setPairMergeOverride(token, merged) {
+    this.data.folderNoteMergeOverrides[token] = merged;
+    await this.forceSave();
+    this.scheduleFolderNoteRender();
+  }
+  installPairedFolderNoteClickHandler() {
+    this.registerDomEvent(document, "click", (event) => {
+      if (!(event.target instanceof HTMLElement) || event.button !== 0) return;
+      if (event.target.closest(".nav-folder-collapse-indicator, .collapse-icon")) return;
+      const title = event.target.closest(".nav-folder-title");
+      const element = title ? this.explorerItem(title) : null;
+      if (!element) return;
+      const folder = this.app.vault.getAbstractFileByPath(this.pathFromElement(element));
+      if (!(folder instanceof import_obsidian.TFolder)) return;
+      const pair = this.resolvePairedFolderNote(folder);
+      if (!pair || !this.isMergedPair(pair)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void this.app.workspace.getLeaf(false).openFile(pair.note);
+    }, true);
+  }
+  scheduleFolderNoteRender() {
+    if (this.folderNoteFrame !== null) return;
+    this.folderNoteFrame = window.requestAnimationFrame(() => {
+      this.folderNoteFrame = null;
+      this.applyFolderNoteDisplay();
+    });
+  }
+  applyFolderNoteDisplay() {
+    const container = this.getExplorerContainer();
+    if (!container) return;
+    container.querySelectorAll(".nav-file.yq-order-folder-note-hidden, .nav-folder.yq-order-folder-note").forEach((element) => element.classList.remove("yq-order-folder-note-hidden", "yq-order-folder-note"));
+    container.querySelectorAll(".nav-folder-title[data-yq-merged-label]").forEach((element) => delete element.dataset.yqMergedLabel);
+    container.querySelectorAll(".nav-file").forEach((element) => {
+      const file = this.app.vault.getAbstractFileByPath(this.pathFromElement(element));
+      if (!(file instanceof import_obsidian.TFile)) return;
+      const pair = this.resolvePairedFolderNote(file);
+      if (!pair || !this.isMergedPair(pair)) return;
+      element.classList.add("yq-order-folder-note-hidden");
+      const folderElement = container.querySelector(`.nav-folder[data-path="${CSS.escape(pair.folder.path)}"]`) || Array.from(container.querySelectorAll(".nav-folder")).find((candidate) => this.pathFromElement(candidate) === pair.folder.path);
+      if (folderElement) {
+        folderElement.classList.add("yq-order-folder-note");
+        const title = folderElement.querySelector(":scope > .nav-folder-title");
+        if (title) title.dataset.yqMergedLabel = "\u2197";
+      }
+    });
+  }
+  async applyIdentitySelection(paths, mode, orderSnapshot, successLabel = "\u5DF2\u5904\u7406") {
+    if (this.identityMaintenanceInProgress) return;
+    const items = [...new Set(paths)].map((path) => this.app.vault.getAbstractFileByPath(path)).filter((item) => item instanceof import_obsidian.TFile || item instanceof import_obsidian.TFolder);
+    if (!items.length && !orderSnapshot) {
+      new import_obsidian.Notice("\u9009\u4E2D\u7684\u9879\u76EE\u5DF2\u4E0D\u5B58\u5728");
+      return;
+    }
+    if (mode === "regenerate") {
+      const proceed = await new Promise((resolve) => new ConfirmActionModal(
+        this.app,
+        "\u91CD\u65B0\u751F\u6210\u9009\u4E2D GUID",
+        `\u5C06\u4E3A ${items.length} \u4E2A\u9879\u76EE\u751F\u6210\u65B0 GUID\uFF0C\u76EE\u5F55\u4F4D\u7F6E\u4E0E\u5144\u5F1F\u987A\u5E8F\u4E0D\u53D8\u3002`,
+        "\u91CD\u65B0\u751F\u6210",
+        resolve
+      ).open());
+      if (!proceed) return;
+    }
+    this.identityMaintenanceInProgress = true;
+    const used = new Set(this.collectIdentityState().entries.map((entry) => entry.guid));
+    const mutations = [];
+    const previousOrders = orderSnapshot ? {} : null;
+    if (previousOrders) {
+      for (const [key2, order] of Object.entries(this.data.orderByFolder)) previousOrders[key2] = [...order];
+    }
+    try {
+      for (const item of items) {
+        const oldGuid = await this.readItemGuid(item);
+        if (mode === "missing" && oldGuid) continue;
+        mutations.push({
+          item,
+          oldGuid,
+          newGuid: createGuid(item instanceof import_obsidian.TFolder ? "d" : "f", this.data.settings.guidBits, used)
+        });
+      }
+      if (!mutations.length && !orderSnapshot) {
+        new import_obsidian.Notice("\u9009\u4E2D\u9879\u76EE\u5747\u5DF2\u6709\u6709\u6548 GUID\uFF0C\u65E0\u9700\u4FEE\u6539");
+        return;
+      }
+      await mapLimit(mutations, 4, async ({ item, newGuid }) => {
+        if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = newGuid;
+        else if (isMarkdown(item)) await this.setFileGuid(item, newGuid);
+        else {
+          this.data.fileGuids[item.path] = newGuid;
+          this.guidByPath.set(item.path, newGuid);
+        }
+      });
+      for (const { item, oldGuid, newGuid } of mutations) {
+        if (oldGuid) replaceGuidInOrders(this.data.orderByFolder, oldGuid, newGuid);
+        else this.addGuidToFolder(item.parent, newGuid);
+      }
+      if (orderSnapshot) this.rebuildOrders(orderSnapshot);
+      this.clearUndoHistory();
+      await this.forceSave();
+      this.refreshExplorer();
+      new import_obsidian.Notice(`${successLabel}\uFF1A\u751F\u6210 ${mutations.length} \u4E2A GUID\uFF0C\u76EE\u5F55\u7D22\u5F15\u5DF2\u5B8C\u6574\u66F4\u65B0`);
+    } catch (error) {
+      await mapLimit(mutations, 4, async ({ item, oldGuid, newGuid }) => {
+        if (item instanceof import_obsidian.TFolder) {
+          if (oldGuid) this.data.folderGuids[item.path] = oldGuid;
+          else delete this.data.folderGuids[item.path];
+        } else if (isMarkdown(item)) {
+          if (oldGuid) await this.setFileGuid(item, oldGuid);
+          else await this.clearFileGuid(item, newGuid);
+        } else {
+          if (oldGuid) this.data.fileGuids[item.path] = oldGuid;
+          else delete this.data.fileGuids[item.path];
+          if (oldGuid) this.guidByPath.set(item.path, oldGuid);
+          else this.guidByPath.delete(item.path);
+        }
+        if (oldGuid) replaceGuidInOrders(this.data.orderByFolder, newGuid, oldGuid);
+        else removeGuidFromOrders(this.data.orderByFolder, newGuid);
+      }).catch(() => void 0);
+      if (previousOrders) this.data.orderByFolder = previousOrders;
+      await this.forceSave().catch(() => void 0);
+      new import_obsidian.Notice(`GUID \u64CD\u4F5C\u5931\u8D25\uFF0C\u5DF2\u5C1D\u8BD5\u56DE\u6EDA\uFF1A${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.identityMaintenanceInProgress = false;
+    }
+  }
+  async checkDuplicateGuids(interactive) {
+    if (this.identityMaintenanceInProgress) return;
+    const state = this.collectIdentityState();
+    const groups = findDuplicateIdentities(state.entries);
+    if (!groups.length) {
+      if (interactive) new import_obsidian.Notice("\u672A\u53D1\u73B0\u91CD\u590D GUID");
+      return;
+    }
+    if (!interactive) {
+      new import_obsidian.Notice(`\u53D1\u73B0 ${groups.length} \u7EC4\u91CD\u590D GUID\uFF0C\u53EF\u8FD0\u884C\u201C\u68C0\u6D4B\u5E76\u4FEE\u590D\u91CD\u590D GUID\u201D\u5904\u7406`);
+      return;
+    }
+    const count = groups.reduce((sum, group) => sum + group.length - 1, 0);
+    const proceed = await new Promise((resolve) => new ConfirmActionModal(
+      this.app,
+      "\u53D1\u73B0\u91CD\u590D GUID",
+      `\u5171 ${groups.length} \u7EC4\u3001${count} \u4E2A\u9879\u76EE\u9700\u8981\u6362\u53F7\u3002\u6BCF\u7EC4\u6309\u5F53\u524D\u76EE\u5F55\u987A\u5E8F\u4FDD\u7559\u9996\u9879\uFF0C\u5176\u4F59\u751F\u6210\u65B0 GUID\u3002`,
+      "\u81EA\u52A8\u4FEE\u590D",
+      resolve
+    ).open());
+    if (!proceed) return;
+    this.identityMaintenanceInProgress = true;
+    const changed = [];
+    try {
+      const used = new Set(state.entries.map((entry) => entry.guid));
+      const replacements = [];
+      groups.forEach((group) => replacements.push(...group.slice(1)));
+      await mapLimit(replacements, 4, async (entry) => {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        const guid = createGuid(entry.kind === "folder" ? "d" : "f", this.data.settings.guidBits, used);
+        if (item instanceof import_obsidian.TFile && isMarkdown(item)) await this.setFileGuid(item, guid);
+        else if (item instanceof import_obsidian.TFile) {
+          this.data.fileGuids[item.path] = guid;
+          this.guidByPath.set(item.path, guid);
+        } else if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = guid;
+        changed.push(entry);
+        if (changed.length % 200 === 0) await yieldToUi();
+      });
+      this.rebuildOrders(state.folderChildrenByPath);
+      this.clearUndoHistory();
+      await this.forceSave();
+      this.refreshExplorer();
+      new import_obsidian.Notice(`\u5DF2\u4FEE\u590D ${count} \u4E2A\u91CD\u590D GUID\uFF0C\u76EE\u5F55\u987A\u5E8F\u4FDD\u6301\u4E0D\u53D8`);
+    } catch (error) {
+      await mapLimit(changed, 4, async (entry) => {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        if (item instanceof import_obsidian.TFile && isMarkdown(item)) await this.setFileGuid(item, entry.guid);
+        else if (item instanceof import_obsidian.TFile) {
+          this.data.fileGuids[item.path] = entry.guid;
+          this.guidByPath.set(item.path, entry.guid);
+        } else if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = entry.guid;
+      }).catch(() => void 0);
+      this.rebuildOrders(state.folderChildrenByPath);
+      new import_obsidian.Notice(`\u4FEE\u590D\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+      await this.reconcileVault(true);
+    } finally {
+      this.identityMaintenanceInProgress = false;
+    }
+  }
+  backupDirectory() {
+    return (0, import_obsidian.normalizePath)(`${this.manifest.dir || `.obsidian/plugins/${this.manifest.id}`}/guid-backups`);
+  }
+  async writeGuidBackup(backup, bits) {
+    const directory = this.backupDirectory();
+    if (!await this.app.vault.adapter.exists(directory)) await this.app.vault.adapter.mkdir(directory);
+    const id = `${Date.now()}-${createGuid("f", 64).slice(2)}`;
+    const file = (0, import_obsidian.normalizePath)(`${directory}/${id}.json`);
+    await this.app.vault.adapter.write(file, JSON.stringify(backup));
+    const meta = { id, createdAt: (/* @__PURE__ */ new Date()).toISOString(), file, bits, count: backup.entries.length };
+    this.data.guidBackups.push(meta);
+    return meta;
+  }
+  pruneGuidBackups() {
+    return this.data.guidBackups.length > 3 ? this.data.guidBackups.splice(0, this.data.guidBackups.length - 3) : [];
+  }
+  async retargetGuidBackups(currentByPath) {
+    for (const meta of this.data.guidBackups) {
+      try {
+        if (!await this.app.vault.adapter.exists(meta.file)) continue;
+        const backup = JSON.parse(await this.app.vault.adapter.read(meta.file));
+        if (!backup.entries.every((entry) => currentByPath.has(entry.path))) continue;
+        backup.entries.forEach((entry) => {
+          entry.replacementGuid = currentByPath.get(entry.path);
+        });
+        await this.app.vault.adapter.write(meta.file, JSON.stringify(backup));
+      } catch (error) {
+        console.warn("[Yuque Sorting] Failed to update a GUID recovery baseline.", error);
+      }
+    }
+  }
+  async replaceAllGuids(bits, createBackup) {
+    if (this.identityMaintenanceInProgress) return;
+    const proceed = await new Promise((resolve) => new ConfirmActionModal(
+      this.app,
+      "\u4E3A\u6574\u4E2A\u5E93\u66F4\u6362 GUID",
+      `\u5C06\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u751F\u6210 ${bits} bit GUID\uFF0C\u5E76\u4FDD\u6301\u5F53\u524D\u76EE\u5F55\u987A\u5E8F\u3002${createBackup ? "\u5C06\u521B\u5EFA\u6062\u590D\u70B9\u3002" : "\u4E0D\u4F1A\u521B\u5EFA\u6301\u4E45\u6062\u590D\u70B9\u3002"}`,
+      "\u5F00\u59CB\u66F4\u6362",
+      resolve
+    ).open());
+    if (!proceed) return;
+    this.identityMaintenanceInProgress = true;
+    const state = this.collectIdentityState();
+    const used = /* @__PURE__ */ new Set();
+    const replacement = new Map(state.entries.map((entry) => [entry.path, createGuid(entry.kind === "folder" ? "d" : "f", bits, used)]));
+    const backup = { version: 1, entries: state.entries.map((entry) => ({ ...entry, replacementGuid: replacement.get(entry.path) })), folderChildrenByPath: state.folderChildrenByPath };
+    const changedMarkdown = [];
+    const previousBits = this.data.settings.guidBits;
+    let backupMeta = null;
+    let obsoleteBackups = [];
+    try {
+      if (createBackup) backupMeta = await this.writeGuidBackup(backup, bits);
+      const markdown = state.entries.filter((entry) => {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        return item instanceof import_obsidian.TFile && isMarkdown(item);
+      });
+      await mapLimit(markdown, 4, async (entry) => {
+        const file = this.app.vault.getAbstractFileByPath(entry.path);
+        await this.setFileGuid(file, replacement.get(entry.path));
+        changedMarkdown.push({ file, guid: entry.guid });
+      });
+      let mapped = 0;
+      for (const entry of state.entries) {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        const guid = replacement.get(entry.path);
+        if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = guid;
+        else if (item instanceof import_obsidian.TFile && !isMarkdown(item)) {
+          this.data.fileGuids[item.path] = guid;
+          this.guidByPath.set(item.path, guid);
+        }
+        mapped += 1;
+        if (mapped % 250 === 0) await yieldToUi();
+      }
+      this.rebuildOrders(state.folderChildrenByPath);
+      this.data.settings.guidBits = bits;
+      obsoleteBackups = this.pruneGuidBackups();
+      await this.retargetGuidBackups(replacement);
+      this.clearUndoHistory();
+      await this.forceSave();
+      for (const obsolete of obsoleteBackups) {
+        try {
+          if (await this.app.vault.adapter.exists(obsolete.file)) await this.app.vault.adapter.remove(obsolete.file);
+        } catch (error) {
+          console.warn("[Yuque Sorting] Failed to remove an expired GUID recovery point.", error);
+        }
+      }
+      this.refreshExplorer();
+      new import_obsidian.Notice(`\u5DF2\u4E3A ${state.entries.length} \u4E2A\u9879\u76EE\u66F4\u6362 GUID`);
+    } catch (error) {
+      await mapLimit(changedMarkdown, 4, async ({ file, guid }) => this.setFileGuid(file, guid)).catch(() => void 0);
+      for (const entry of state.entries) {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = entry.guid;
+        else if (item instanceof import_obsidian.TFile && !isMarkdown(item)) {
+          this.data.fileGuids[item.path] = entry.guid;
+          this.guidByPath.set(item.path, entry.guid);
+        }
+      }
+      this.data.settings.guidBits = previousBits;
+      this.rebuildOrders(state.folderChildrenByPath);
+      if (obsoleteBackups.length) this.data.guidBackups.unshift(...obsoleteBackups);
+      await this.retargetGuidBackups(new Map(state.entries.map((entry) => [entry.path, entry.guid])));
+      if (backupMeta) {
+        this.data.guidBackups = this.data.guidBackups.filter((candidate) => candidate.id !== (backupMeta == null ? void 0 : backupMeta.id));
+        if (await this.app.vault.adapter.exists(backupMeta.file)) await this.app.vault.adapter.remove(backupMeta.file);
+      }
+      new import_obsidian.Notice(`\u66F4\u6362\u5931\u8D25\uFF0C\u5DF2\u5C1D\u8BD5\u56DE\u6EDA\uFF1A${error instanceof Error ? error.message : String(error)}`);
+      await this.reconcileVault(true);
+    } finally {
+      this.identityMaintenanceInProgress = false;
+    }
+  }
+  async restoreGuidBackup(meta) {
+    if (this.identityMaintenanceInProgress) return;
+    const changed = [];
+    let currentOrders = null;
+    try {
+      const backup = JSON.parse(await this.app.vault.adapter.read(meta.file));
+      const current = this.collectIdentityState();
+      currentOrders = current.folderChildrenByPath;
+      const currentByPath = new Map(current.entries.map((entry) => [entry.path, entry]));
+      const valid = backup.entries.length === current.entries.length && backup.entries.every((entry) => {
+        const now = currentByPath.get(entry.path);
+        return (now == null ? void 0 : now.kind) === entry.kind && now.guid === entry.replacementGuid;
+      });
+      if (!valid) {
+        new import_obsidian.Notice("\u65E0\u6CD5\u6062\u590D\uFF1A\u5F53\u524D\u5E93\u5DF2\u6709\u65B0\u589E\u3001\u5220\u9664\u3001\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216 GUID \u53D8\u5316");
+        return;
+      }
+      const proceed = await new Promise((resolve) => new ConfirmActionModal(this.app, "\u6062\u590D GUID", `\u6062\u590D ${meta.createdAt} \u7684 ${meta.count} \u9879\u8EAB\u4EFD\u548C\u76EE\u5F55\u987A\u5E8F\u3002`, "\u6062\u590D", resolve).open());
+      if (!proceed) return;
+      this.identityMaintenanceInProgress = true;
+      await mapLimit(backup.entries, 4, async (entry) => {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        if (item instanceof import_obsidian.TFile && isMarkdown(item)) await this.setFileGuid(item, entry.guid);
+        else if (item instanceof import_obsidian.TFile) {
+          this.data.fileGuids[item.path] = entry.guid;
+          this.guidByPath.set(item.path, entry.guid);
+        } else if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = entry.guid;
+        changed.push(entry);
+      });
+      this.rebuildOrders(backup.folderChildrenByPath);
+      await this.retargetGuidBackups(new Map(backup.entries.map((entry) => [entry.path, entry.guid])));
+      this.clearUndoHistory();
+      await this.forceSave();
+      this.refreshExplorer();
+      new import_obsidian.Notice("GUID \u4E0E\u76EE\u5F55\u987A\u5E8F\u5DF2\u6062\u590D");
+    } catch (error) {
+      await mapLimit(changed, 4, async (entry) => {
+        const item = this.app.vault.getAbstractFileByPath(entry.path);
+        if (item instanceof import_obsidian.TFile && isMarkdown(item)) await this.setFileGuid(item, entry.replacementGuid);
+        else if (item instanceof import_obsidian.TFile) {
+          this.data.fileGuids[item.path] = entry.replacementGuid;
+          this.guidByPath.set(item.path, entry.replacementGuid);
+        } else if (item instanceof import_obsidian.TFolder) this.data.folderGuids[item.path] = entry.replacementGuid;
+      }).catch(() => void 0);
+      if (currentOrders) this.rebuildOrders(currentOrders);
+      new import_obsidian.Notice(`\u6062\u590D\u5931\u8D25\uFF0C\u5DF2\u5C1D\u8BD5\u56DE\u6EDA\uFF1A${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.identityMaintenanceInProgress = false;
+    }
+  }
   async requestManifestImport() {
+    var _a, _b, _c;
     const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
     if (!manifests.length) {
       new import_obsidian.Notice("\u672A\u627E\u5230 _yuque_order.json");
       return;
     }
-    const report = await this.inspectManifestConsistency(manifests);
-    if (manifestIssueCount(report) > 0) {
-      const proceed = await new Promise((resolve) => {
-        new ManifestImportConfirmModal(this.app, report, resolve).open();
-      });
-      if (!proceed) {
-        new import_obsidian.Notice("\u5DF2\u653E\u5F03\u5BFC\u5165\u8BED\u96C0\u987A\u5E8F\u6E05\u5355");
-        return;
+    if (this.identityMaintenanceInProgress) return;
+    const parsed = [];
+    const problems = [];
+    for (const file of manifests) {
+      try {
+        const raw = JSON.parse(await this.app.vault.read(file));
+        if ((raw == null ? void 0 : raw.version) !== 2 || typeof raw.exportId !== "string" || !Array.isArray(raw.directories)) {
+          problems.push(`${file.path}\uFF1A\u4E0D\u662F v2 \u6E05\u5355`);
+        } else parsed.push({ file, raw });
+      } catch (e) {
+        problems.push(`${file.path}\uFF1AJSON \u65E0\u6548`);
       }
     }
-    this.manifestNoticeShown = false;
-    await this.seedFromManifests();
+    if (!parsed.length) {
+      new import_obsidian.Notice(problems.length ? problems[0] : "\u6CA1\u6709\u53EF\u7528\u7684\u8BED\u96C0\u5BFC\u51FA\u6E05\u5355");
+      return;
+    }
+    const seen = /* @__PURE__ */ new Set();
+    const verifiedMarkdownGuids = /* @__PURE__ */ new Map();
+    const markdownTextByPath = /* @__PURE__ */ new Map();
+    let matched = 0;
+    const actualDuplicates = findDuplicateIdentities(this.collectIdentityState().entries);
+    if (actualDuplicates.length) problems.push(`\u5F53\u524D\u5E93\u5B58\u5728 ${actualDuplicates.length} \u7EC4\u91CD\u590D GUID`);
+    for (const { file, raw } of parsed) {
+      const adoptExportIdentity = !this.data.consumedManifestIds.includes(raw.exportId);
+      const root = ((_a = file.parent) == null ? void 0 : _a.path) || "";
+      const expectedPaths = /* @__PURE__ */ new Set();
+      for (const directory of raw.directories) {
+        if (!directory || typeof directory.path !== "string" || !Array.isArray(directory.items)) {
+          problems.push(`${file.path}\uFF1A\u76EE\u5F55\u7ED3\u6784\u65E0\u6548`);
+          continue;
+        }
+        for (const entry of directory.items) {
+          if (!entry || !["file", "folder"].includes(entry.kind) || typeof entry.path !== "string" || typeof entry.guid !== "string") {
+            problems.push(`${file.path}\uFF1A\u6761\u76EE\u65E0\u6548`);
+            continue;
+          }
+          const expectedKind = entry.kind === "folder" ? "d" : "f";
+          const bits = Number(raw.guidBits) === 72 ? 72 : 64;
+          const currentLength = bits === 72 ? 13 : 11;
+          const currentGuid = new RegExp(`^${expectedKind}-[A-Za-z0-9]{${currentLength}}$`).test(entry.guid);
+          const legacyLength = bits === 72 ? 12 : 11;
+          const legacyGuid = new RegExp(`^${expectedKind}:[A-Za-z0-9_-]{${legacyLength}}$`).test(entry.guid);
+          if (!currentGuid && !legacyGuid) {
+            problems.push(`${entry.path}\uFF1AGUID \u683C\u5F0F\u6216\u7C7B\u578B\u524D\u7F00\u4E0D\u7B26`);
+          }
+          if (seen.has(entry.guid)) problems.push(`${file.path}\uFF1A\u91CD\u590D GUID ${entry.guid}`);
+          seen.add(entry.guid);
+          const path = root ? `${root}/${entry.path}` : entry.path;
+          if (expectedPaths.has((0, import_obsidian.normalizePath)(path))) problems.push(`${entry.path}\uFF1A\u6E05\u5355\u4E2D\u5B58\u5728\u91CD\u590D\u6700\u7EC8\u8DEF\u5F84`);
+          expectedPaths.add((0, import_obsidian.normalizePath)(path));
+          const relativeParent = (0, import_obsidian.normalizePath)(entry.path).split("/").slice(0, -1).join("/");
+          const expectedParent = directory.path ? (0, import_obsidian.normalizePath)(directory.path) : "";
+          if (relativeParent !== expectedParent) problems.push(`${entry.path}\uFF1A\u7236\u7EA7\u4E0E\u76EE\u5F55\u6E05\u5355\u4E0D\u4E00\u81F4`);
+          const item = this.app.vault.getAbstractFileByPath(path);
+          if (!item || entry.kind === "file" !== item instanceof import_obsidian.TFile) problems.push(`${path}\uFF1A\u5F53\u524D\u5E93\u7F3A\u5931\u6216\u7C7B\u578B\u4E0D\u7B26`);
+          else {
+            let actualGuid = this.getItemGuidSync(item);
+            if (item instanceof import_obsidian.TFile && isMarkdown(item) && actualGuid !== entry.guid) {
+              try {
+                const text = await this.app.vault.read(item);
+                markdownTextByPath.set(path, text);
+                actualGuid = this.readGuidFromText(text);
+              } catch (e) {
+                actualGuid = null;
+              }
+            }
+            if (item instanceof import_obsidian.TFile && isMarkdown(item) && actualGuid) verifiedMarkdownGuids.set(path, actualGuid);
+            if (adoptExportIdentity && item instanceof import_obsidian.TFile && isMarkdown(item) && actualGuid !== entry.guid) problems.push(`${path}\uFF1Afrontmatter GUID \u4E0E\u6E05\u5355\u4E0D\u7B26`);
+            else matched += 1;
+          }
+        }
+      }
+      if (raw.resources !== void 0 && !Array.isArray(raw.resources)) {
+        problems.push(`${file.path}\uFF1Aresources \u7ED3\u6784\u65E0\u6548`);
+      }
+      for (const entry of Array.isArray(raw.resources) ? raw.resources : []) {
+        if (!entry || !["file", "folder"].includes(entry.kind) || typeof entry.path !== "string" || typeof entry.guid !== "string") {
+          problems.push(`${file.path}\uFF1A\u8D44\u6E90\u6761\u76EE\u65E0\u6548`);
+          continue;
+        }
+        const expectedKind = entry.kind === "folder" ? "d" : "f";
+        const bits = Number(raw.guidBits) === 72 ? 72 : 64;
+        const currentLength = bits === 72 ? 13 : 11;
+        const currentGuid = new RegExp(`^${expectedKind}-[A-Za-z0-9]{${currentLength}}$`).test(entry.guid);
+        const legacyLength = bits === 72 ? 12 : 11;
+        const legacyGuid = new RegExp(`^${expectedKind}:[A-Za-z0-9_-]{${legacyLength}}$`).test(entry.guid);
+        if (!currentGuid && !legacyGuid) problems.push(`${entry.path}\uFF1A\u8D44\u6E90 GUID \u683C\u5F0F\u6216\u7C7B\u578B\u524D\u7F00\u4E0D\u7B26`);
+        if (seen.has(entry.guid)) problems.push(`${file.path}\uFF1A\u91CD\u590D GUID ${entry.guid}`);
+        seen.add(entry.guid);
+        const path = root ? `${root}/${entry.path}` : entry.path;
+        const normalized = (0, import_obsidian.normalizePath)(path);
+        if (expectedPaths.has(normalized)) problems.push(`${entry.path}\uFF1A\u6E05\u5355\u4E2D\u5B58\u5728\u91CD\u590D\u6700\u7EC8\u8DEF\u5F84`);
+        expectedPaths.add(normalized);
+        const item = this.app.vault.getAbstractFileByPath(path);
+        if (!item || entry.kind === "file" !== item instanceof import_obsidian.TFile) problems.push(`${path}\uFF1A\u5F53\u524D\u5E93\u7F3A\u5931\u6216\u7C7B\u578B\u4E0D\u7B26`);
+        else matched += 1;
+      }
+      if (raw.resources === void 0) {
+        for (const directory of raw.directories) for (const entry of directory.items) {
+          if ((entry == null ? void 0 : entry.kind) !== "file" || !/\.md$/i.test(entry.path)) continue;
+          const path = root ? `${root}/${entry.path}` : entry.path;
+          const note = this.app.vault.getAbstractFileByPath(path);
+          if (!(note instanceof import_obsidian.TFile)) continue;
+          let text = markdownTextByPath.get(path);
+          if (text === void 0) {
+            try {
+              text = await this.app.vault.read(note);
+              markdownTextByPath.set(path, text);
+            } catch (e) {
+              continue;
+            }
+          }
+          for (const resourcePath of referencedLocalPaths(text, path, root)) {
+            if (this.app.vault.getAbstractFileByPath(resourcePath)) expectedPaths.add((0, import_obsidian.normalizePath)(resourcePath));
+          }
+        }
+      }
+      const prefix = root ? `${root}/` : "";
+      let extraCount = 0;
+      for (const item of this.app.vault.getAllLoadedFiles()) {
+        if (!item.path || item.path === file.path || prefix && !item.path.startsWith(prefix)) continue;
+        if (!expectedPaths.has((0, import_obsidian.normalizePath)(item.path))) extraCount += 1;
+      }
+      if (extraCount) problems.push(`${file.path}\uFF1A\u5F53\u524D\u5E93\u591A\u51FA ${extraCount} \u4E2A\u9879\u76EE`);
+    }
+    const changedDirectories = [];
+    let changedPositions = 0;
+    const previewLines = [];
+    for (const { file, raw } of parsed) {
+      const root = ((_b = file.parent) == null ? void 0 : _b.path) || "";
+      for (const directory of raw.directories) {
+        if (!directory || typeof directory.path !== "string" || !Array.isArray(directory.items)) continue;
+        const folderPath = directory.path ? root ? `${root}/${directory.path}` : directory.path : root;
+        const folder = folderPath ? this.app.vault.getAbstractFileByPath(folderPath) : this.app.vault.getRoot();
+        if (!(folder instanceof import_obsidian.TFolder)) continue;
+        const current = this.sortFolderItems(folder.path, folder.children).map((item) => item.path);
+        const currentSet = new Set(current);
+        const listed = directory.items.map((entry) => typeof (entry == null ? void 0 : entry.path) === "string" ? root ? `${root}/${entry.path}` : entry.path : "").filter((path) => currentSet.has(path));
+        const listedSet = new Set(listed);
+        const next = [...listed, ...current.filter((path) => !listedSet.has(path))];
+        const changed = next.reduce((count, path, index) => count + (current[index] !== path ? 1 : 0), 0);
+        if (!changed) continue;
+        changedDirectories.push(folderPath || "Vault \u6839\u76EE\u5F55");
+        changedPositions += changed;
+        if (previewLines.length < 10) {
+          const names = (paths) => paths.slice(0, 6).map((path) => path.split("/").pop()).join(" \u2192 ") + (paths.length > 6 ? " \u2192 \u2026" : "");
+          previewLines.push(`${folderPath || "Vault \u6839\u76EE\u5F55"}\uFF1A\u5F53\u524D [${names(current)}]\uFF1B\u6062\u590D\u540E [${names(next)}]`);
+        }
+      }
+    }
+    const dataBeforeConfirmation = JSON.stringify(this.data);
+    const fileState = () => JSON.stringify(this.app.vault.getAllLoadedFiles().map((item) => [item.path, item instanceof import_obsidian.TFile ? [item.stat.mtime, item.stat.size] : "folder"]));
+    const filesBeforeConfirmation = fileState();
+    const newManifests = parsed.filter(({ raw }) => !this.data.consumedManifestIds.includes(raw.exportId)).length;
+    const proceed = await new Promise((resolve) => new ConfirmActionModal(
+      this.app,
+      "\u786E\u8BA4\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F",
+      `\u5DF2\u68C0\u67E5 ${parsed.length} \u4EFD\u6709\u6548\u6E05\u5355\uFF1B${changedDirectories.length} \u4E2A\u76EE\u5F55\u7684\u987A\u5E8F\u5C06\u53D8\u5316\uFF0C${changedPositions} \u4E2A\u663E\u793A\u4F4D\u7F6E\u4E0D\u540C\u3002${changedDirectories.length ? previewLines.join("\uFF1B") + (changedDirectories.length > 10 ? "\uFF1B\u5176\u4F59\u76EE\u5F55\u7701\u7565" : "") : "\u5F53\u524D\u53EF\u5339\u914D\u9879\u76EE\u7684\u663E\u793A\u987A\u5E8F\u4E0E\u6E05\u5355\u4E00\u81F4\u3002"} ${problems.length ? `\u53E6\u6709 ${problems.length} \u9879\u5185\u5BB9/\u8EAB\u4EFD\u5DEE\u5F02\uFF1A${problems.slice(0, 10).join("\uFF1B")}${problems.length > 10 ? "\uFF1B\u5176\u4F59\u7701\u7565" : ""}\u3002\u7EE7\u7EED\u4EC5\u5904\u7406\u80FD\u591F\u5339\u914D\u7684\u9879\u76EE\u3002` : "\u672A\u53D1\u73B0\u5185\u5BB9\u6216\u8EAB\u4EFD\u5DEE\u5F02\u3002"} ${newManifests ? `${newManifests} \u4EFD\u6E05\u5355\u4E3A\u9996\u6B21\u4F7F\u7528\uFF0C\u5C06\u6309\u73B0\u6709\u89C4\u5219\u91C7\u7528\u5BFC\u51FA\u8EAB\u4EFD\u5E76\u5EFA\u7ACB\u7D22\u5F15\uFF1BMarkdown \u6B63\u6587\u4E0D\u6539\u5199\u3002` : "\u4EC5\u6062\u590D\u987A\u5E8F\uFF0C\u4E0D\u8986\u76D6\u540E\u6765\u66F4\u6362\u7684 GUID\u3002"} \u4E0D\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664\u5B9E\u9645\u6587\u4EF6\u3002\u786E\u8BA4\u540E\u4F1A\u6E05\u7A7A\u62D6\u62FD\u64A4\u9500\u5386\u53F2\uFF1B\u53D6\u6D88\u6216\u5173\u95ED\u7A97\u53E3\u4E0D\u4FEE\u6539\u6570\u636E\u3002`,
+      problems.length ? "\u786E\u8BA4\u6062\u590D\u5339\u914D\u9879" : "\u786E\u8BA4\u6062\u590D\u76EE\u5F55\u987A\u5E8F",
+      resolve
+    ).open());
+    if (!proceed) return;
+    if (this.identityMaintenanceInProgress || JSON.stringify(this.data) !== dataBeforeConfirmation || fileState() !== filesBeforeConfirmation) {
+      new import_obsidian.Notice("\u786E\u8BA4\u671F\u95F4\u6587\u4EF6\u3001\u8EAB\u4EFD\u6216\u76EE\u5F55\u987A\u5E8F\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u540E\u6062\u590D");
+      return;
+    }
+    this.identityMaintenanceInProgress = true;
+    try {
+      verifiedMarkdownGuids.forEach((guid, path) => this.guidByPath.set(path, guid));
+      for (const { file, raw } of parsed) {
+        const root = ((_c = file.parent) == null ? void 0 : _c.path) || "";
+        if (!this.data.consumedManifestIds.includes(raw.exportId)) {
+          const identityEntries = [];
+          for (const directory of raw.directories) identityEntries.push(...directory.items);
+          if (Array.isArray(raw.resources)) identityEntries.push(...raw.resources);
+          for (const entry of identityEntries) {
+            const path = root ? `${root}/${entry.path}` : entry.path;
+            const item = this.app.vault.getAbstractFileByPath(path);
+            const previousGuid = item ? this.getItemGuidSync(item) : null;
+            if (entry.kind === "folder" && item instanceof import_obsidian.TFolder) this.data.folderGuids[path] = entry.guid;
+            else if (entry.kind === "file" && item instanceof import_obsidian.TFile) {
+              if (!isMarkdown(item)) this.data.fileGuids[path] = entry.guid;
+              if (!isMarkdown(item) || this.getItemGuidSync(item) === entry.guid) this.guidByPath.set(path, entry.guid);
+            }
+            if (previousGuid && previousGuid !== entry.guid && (!(item instanceof import_obsidian.TFile) || !isMarkdown(item))) {
+              replaceGuidInOrders(this.data.orderByFolder, previousGuid, entry.guid);
+            }
+          }
+        }
+        for (const directory of raw.directories) {
+          const folderPath = directory.path ? root ? `${root}/${directory.path}` : directory.path : root;
+          const folder = folderPath ? this.app.vault.getAbstractFileByPath(folderPath) : this.app.vault.getRoot();
+          if (!(folder instanceof import_obsidian.TFolder)) continue;
+          const wanted = directory.items.map((entry) => {
+            const path = root ? `${root}/${entry.path}` : entry.path;
+            const item = this.app.vault.getAbstractFileByPath(path);
+            return item ? this.getItemGuidSync(item) : null;
+          }).filter((guid) => typeof guid === "string");
+          const key2 = this.folderKeySync(folder);
+          const wantedSet = new Set(wanted);
+          this.data.orderByFolder[key2] = [...wanted, ...(this.data.orderByFolder[key2] || []).filter((guid) => !wantedSet.has(guid))];
+        }
+        if (!this.data.consumedManifestIds.includes(raw.exportId)) this.data.consumedManifestIds.push(raw.exportId);
+      }
+      this.clearUndoHistory();
+      await this.forceSave();
+      this.refreshExplorer();
+      new import_obsidian.Notice(`\u5DF2\u4ECE ${parsed.length} \u4EFD\u6E05\u5355\u6062\u590D ${matched} \u4E2A\u9879\u76EE\u7684\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F`);
+    } finally {
+      this.identityMaintenanceInProgress = false;
+    }
   }
   async inspectManifestConsistency(manifests) {
     var _a;
@@ -911,10 +2731,10 @@ ${text}`;
       });
       collectGuids(raw.tree);
       const desired = /* @__PURE__ */ new Map();
-      const append = (key, guid) => {
-        const list = desired.get(key) || [];
+      const append = (key2, guid) => {
+        const list = desired.get(key2) || [];
         if (!list.includes(guid)) list.push(guid);
-        desired.set(key, list);
+        desired.set(key2, list);
       };
       const visit = (nodes, fallbackFolder) => {
         nodes.forEach((node) => {
@@ -932,8 +2752,8 @@ ${text}`;
               this.data.folderGuids[folder.path] = guid;
               folderByGuid.set(guid, folder);
               const parentFolder2 = folder.parent || fallbackFolder;
-              const key2 = this.folderKeySync(parentFolder2);
-              append(key2, guid);
+              const key3 = this.folderKeySync(parentFolder2);
+              append(key3, guid);
               if (Array.isArray(node.children) && node.children.length) visit(node.children, folder);
               return;
             }
@@ -942,21 +2762,21 @@ ${text}`;
           }
           const logicalItem = folderByGuid.get(guid) || (item instanceof import_obsidian.TFile ? this.findFolderForNote(item) : null) || item;
           const parentFolder = logicalItem.parent || fallbackFolder;
-          const key = this.folderKeySync(parentFolder);
-          append(key, guid);
+          const key2 = this.folderKeySync(parentFolder);
+          append(key2, guid);
           const childFolder = logicalItem instanceof import_obsidian.TFolder ? logicalItem : parentFolder;
           if (Array.isArray(node.children) && node.children.length) visit(node.children, childFolder);
         });
       };
       visit(raw.tree, manifestFile.parent);
       const manifestGuidSet = new Set(manifestGuids);
-      Object.keys(this.data.orderByFolder).forEach((key) => {
-        this.data.orderByFolder[key] = (this.data.orderByFolder[key] || []).filter((guid) => !manifestGuidSet.has(guid));
+      Object.keys(this.data.orderByFolder).forEach((key2) => {
+        this.data.orderByFolder[key2] = (this.data.orderByFolder[key2] || []).filter((guid) => !manifestGuidSet.has(guid));
       });
-      desired.forEach((wanted, key) => {
-        const old = this.data.orderByFolder[key] || [];
+      desired.forEach((wanted, key2) => {
+        const old = this.data.orderByFolder[key2] || [];
         const next = [...wanted, ...old];
-        this.data.orderByFolder[key] = next;
+        this.data.orderByFolder[key2] = next;
         if (next.length !== old.length || next.some((guid, index) => guid !== old[index])) {
           seeded += 1;
         }
@@ -974,6 +2794,7 @@ ${text}`;
     }
   }
   findFolderForNote(file) {
+    if (file.parent && file.basename === file.parent.name) return file.parent;
     const folder = this.app.vault.getAbstractFileByPath(stripMarkdown(file.path));
     return folder instanceof import_obsidian.TFolder ? folder : null;
   }
@@ -1035,7 +2856,7 @@ ${text}`;
     } catch (error) {
       if (!this.manifestNoticeShown) {
         this.manifestNoticeShown = true;
-        console.warn("[Yuque Order Drag] FileExplorer patch unavailable; using default order.", error);
+        console.warn("[Yuque Sorting] FileExplorer patch unavailable; using default order.", error);
       }
     }
   }
@@ -1163,6 +2984,11 @@ ${text}`;
       const item = this.explorerItem(event.target);
       const path = item && this.pathFromElement(item);
       if (!path || !event.dataTransfer) return;
+      event.stopImmediatePropagation();
+      if (this.dropInProgress || this.undoInProgress) {
+        event.preventDefault();
+        return;
+      }
       this.dragSourcePath = path;
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("application/x-yq-order-path", path);
@@ -1171,6 +2997,7 @@ ${text}`;
     }, true);
     this.registerDomEvent(document, "dragover", (event) => {
       if (!this.dragSourcePath) return;
+      event.stopImmediatePropagation();
       const item = this.explorerItem(event.target);
       if (!item || this.pathFromElement(item) === this.dragSourcePath) {
         this.clearDropFeedback();
@@ -1188,8 +3015,13 @@ ${text}`;
     }, true);
     this.registerDomEvent(document, "drop", (event) => {
       if (!this.dragSourcePath) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
       const target = this.explorerItem(event.target);
-      if (!target) return;
+      if (!target) {
+        this.clearDragState();
+        return;
+      }
       event.preventDefault();
       const targetPath = this.pathFromElement(target);
       const position = this.dropPosition(this.dragSourcePath, targetPath, event.clientY, target);
@@ -1215,9 +3047,11 @@ ${text}`;
         if (node instanceof HTMLElement) markDraggable(node);
       }));
       this.scheduleDomOrder();
+      this.scheduleFolderNoteRender();
     });
     this.explorerObserver.observe(container, { childList: true, subtree: true });
     this.scheduleDomOrder();
+    this.scheduleFolderNoteRender();
   }
   clearDragState() {
     var _a;
@@ -1226,17 +3060,9 @@ ${text}`;
     this.clearDropFeedback();
   }
   rememberDragUndo(record) {
+    this.dragUndoStack.push(record);
+    if (this.dragUndoStack.length > 50) this.dragUndoStack.shift();
     this.lastDragUndo = record;
-    const content = document.createDocumentFragment();
-    content.append("\u62D6\u62FD\u5DF2\u5B8C\u6210\u3002 ");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "\u64A4\u9500";
-    button.addEventListener("click", () => {
-      if (this.lastDragUndo === record) void this.undoLastDrag();
-    }, { once: true });
-    content.appendChild(button);
-    new import_obsidian.Notice(content, 8e3);
   }
   async rollbackFolderNoteConversion(createdFolderPath, targetNoteOriginalPath, targetNoteMovedPath, targetNotePosition) {
     if (!createdFolderPath || !targetNoteOriginalPath || !targetNoteMovedPath) return true;
@@ -1244,7 +3070,7 @@ ${text}`;
       const movedTarget = this.app.vault.getAbstractFileByPath(targetNoteMovedPath);
       if (movedTarget instanceof import_obsidian.TFile && !this.app.vault.getAbstractFileByPath(targetNoteOriginalPath)) {
         if (targetNotePosition) this.pendingUndoPositions.set(targetNotePosition.guid, targetNotePosition);
-        await this.app.fileManager.renameFile(movedTarget, targetNoteOriginalPath);
+        await this.renameTracked(movedTarget, targetNoteOriginalPath);
       }
       const createdFolder = this.app.vault.getAbstractFileByPath(createdFolderPath);
       if (createdFolder instanceof import_obsidian.TFolder) {
@@ -1264,11 +3090,12 @@ ${text}`;
     }
   }
   async undoLastDrag() {
-    const record = this.lastDragUndo;
+    const record = this.dragUndoStack.length ? this.dragUndoStack[this.dragUndoStack.length - 1] : this.lastDragUndo;
     if (!record || this.undoInProgress) return;
     const source = this.app.vault.getAbstractFileByPath(record.sourceMovedPath);
     if (!source || this.getItemGuidSync(source) !== record.sourceGuid) {
-      this.lastDragUndo = null;
+      this.dragUndoStack.pop();
+      this.lastDragUndo = this.dragUndoStack[this.dragUndoStack.length - 1] || null;
       new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u88AB\u62D6\u9879\u76EE\u5DF2\u88AB\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664");
       return;
     }
@@ -1279,7 +3106,8 @@ ${text}`;
     }
     const targetNote = record.targetNoteMovedPath ? this.app.vault.getAbstractFileByPath(record.targetNoteMovedPath) : null;
     if (record.targetNoteMovedPath && (!(targetNote instanceof import_obsidian.TFile) || this.getItemGuidSync(targetNote) !== record.targetNoteGuid)) {
-      this.lastDragUndo = null;
+      this.dragUndoStack.pop();
+      this.lastDragUndo = this.dragUndoStack[this.dragUndoStack.length - 1] || null;
       new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u76EE\u6807\u6587\u4EF6\u5939\u7B14\u8BB0\u5DF2\u88AB\u79FB\u52A8\u3001\u91CD\u547D\u540D\u6216\u5220\u9664");
       return;
     }
@@ -1290,7 +3118,8 @@ ${text}`;
     if (record.createdFolderPath) {
       const createdFolder = this.app.vault.getAbstractFileByPath(record.createdFolderPath);
       if (!(createdFolder instanceof import_obsidian.TFolder)) {
-        this.lastDragUndo = null;
+        this.dragUndoStack.pop();
+        this.lastDragUndo = this.dragUndoStack[this.dragUndoStack.length - 1] || null;
         new import_obsidian.Notice("\u65E0\u6CD5\u64A4\u9500\uFF1A\u62D6\u62FD\u521B\u5EFA\u7684\u6587\u4EF6\u5939\u5DF2\u4E0D\u5B58\u5728");
         return;
       }
@@ -1301,19 +3130,20 @@ ${text}`;
       }
     }
     this.undoInProgress = true;
-    this.lastDragUndo = null;
+    this.dragUndoStack.pop();
+    this.lastDragUndo = this.dragUndoStack[this.dragUndoStack.length - 1] || null;
     const currentPosition = this.captureItemPosition(source, record.sourceGuid);
     let sourceRestored = false;
     try {
       if (record.sourceMovedPath !== record.sourceOriginalPath) {
         this.pendingUndoPositions.set(record.sourceGuid, record.sourcePosition);
-        await this.app.fileManager.renameFile(source, record.sourceOriginalPath);
+        await this.renameTracked(source, record.sourceOriginalPath);
         sourceRestored = true;
       }
       this.restoreStoredGuidPosition(record.sourcePosition);
       if (targetNote instanceof import_obsidian.TFile && record.targetNoteOriginalPath && record.targetNotePosition) {
         this.pendingUndoPositions.set(record.targetNotePosition.guid, record.targetNotePosition);
-        await this.app.fileManager.renameFile(targetNote, record.targetNoteOriginalPath);
+        await this.renameTracked(targetNote, record.targetNoteOriginalPath);
         this.restoreStoredGuidPosition(record.targetNotePosition);
       }
       if (record.createdFolderPath) {
@@ -1334,12 +3164,13 @@ ${text}`;
         const restoredSource = this.app.vault.getAbstractFileByPath(record.sourceOriginalPath);
         if (restoredSource && !this.app.vault.getAbstractFileByPath(record.sourceMovedPath)) {
           try {
-            await this.app.fileManager.renameFile(restoredSource, record.sourceMovedPath);
+            await this.renameTracked(restoredSource, record.sourceMovedPath);
             this.restoreStoredGuidPosition(currentPosition);
           } catch (e) {
           }
         }
       }
+      this.dragUndoStack.push(record);
       this.lastDragUndo = record;
       new import_obsidian.Notice(`\u64A4\u9500\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -1351,6 +3182,16 @@ ${text}`;
     }
   }
   async handleDrop(sourcePath, targetPath, position) {
+    if (this.transferInProgress) return;
+    if (this.dropInProgress || this.undoInProgress) return;
+    this.dropInProgress = true;
+    try {
+      await this.executeDrop(sourcePath, targetPath, position);
+    } finally {
+      this.dropInProgress = false;
+    }
+  }
+  async executeDrop(sourcePath, targetPath, position) {
     var _a;
     const source = this.app.vault.getAbstractFileByPath(sourcePath);
     const target = this.app.vault.getAbstractFileByPath(targetPath);
@@ -1385,7 +3226,11 @@ ${text}`;
           createdFolderPath = folderPath;
         }
         await this.ensureFolderGuid(targetFolder);
-        await this.app.fileManager.renameFile(target, targetNoteMovedPath);
+        await this.renameTracked(target, targetNoteMovedPath);
+        const folderGuid = this.getItemGuidSync(targetFolder);
+        if (folderGuid && targetNotePosition) {
+          this.restoreStoredGuidPosition({ ...targetNotePosition, guid: folderGuid });
+        }
       } catch (error) {
         const restored = await this.rollbackFolderNoteConversion(
           createdFolderPath,
@@ -1416,7 +3261,7 @@ ${text}`;
         return;
       }
       try {
-        await this.app.fileManager.renameFile(source, destination);
+        await this.renameTracked(source, destination);
       } catch (error) {
         const restored = await this.rollbackFolderNoteConversion(
           createdFolderPath,
@@ -1428,7 +3273,7 @@ ${text}`;
         new import_obsidian.Notice(`\u79FB\u52A8\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         return;
       }
-      if (sourceGuid2) {
+      if (sourceGuid2 && this.folderKeySync(targetFolder) !== sourceGuid2) {
         relocateGuid(
           this.data.orderByFolder,
           this.folderKeySync(targetFolder),
@@ -1477,13 +3322,13 @@ ${text}`;
         before: position === "before"
       });
       try {
-        await this.app.fileManager.renameFile(source, destination);
+        await this.renameTracked(source, destination);
       } catch (error) {
         this.pendingDropPlacements.delete(sourceGuid);
         new import_obsidian.Notice(`\u79FB\u52A8\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         return;
       }
-      this.placeGuidRelative(target.parent, sourceGuid, targetGuid, position === "before");
+      this.placeGuidRelative(target.parent, sourceGuid, this.getItemGuidSync(target) || targetGuid, position === "before");
       this.queueSave(true);
       await this.flushSave();
       window.setTimeout(() => this.pendingDropPlacements.delete(sourceGuid), 1e3);
@@ -1501,10 +3346,10 @@ ${text}`;
       });
       return;
     }
-    const key = this.folderKeySync(source.parent);
+    const key2 = this.folderKeySync(source.parent);
     const fallbackOrder = source.parent.children.filter((child) => child instanceof import_obsidian.TFolder || child instanceof import_obsidian.TFile).map((child) => this.getItemGuidSync(child)).filter((guid) => Boolean(guid));
-    const currentOrder = ((_a = this.data.orderByFolder[key]) == null ? void 0 : _a.length) ? this.data.orderByFolder[key] : fallbackOrder;
-    this.data.orderByFolder[key] = moveGuid(currentOrder, sourceGuid, targetGuid, position === "before");
+    const currentOrder = ((_a = this.data.orderByFolder[key2]) == null ? void 0 : _a.length) ? this.data.orderByFolder[key2] : fallbackOrder;
+    this.data.orderByFolder[key2] = moveGuid(currentOrder, sourceGuid, targetGuid, position === "before");
     this.queueSave(true);
     await this.flushSave();
     this.refreshExplorer();
@@ -1522,6 +3367,7 @@ ${text}`;
   }
   refreshExplorer() {
     if (this.explorerRefreshFrame !== null) return;
+    if (this.autoCopyScope) return;
     this.explorerRefreshFrame = window.requestAnimationFrame(() => {
       this.explorerRefreshFrame = null;
       this.performExplorerRefresh();
@@ -1537,6 +3383,7 @@ ${text}`;
         else (_a = view.rerender) == null ? void 0 : _a.call(view);
       }
       this.scheduleDomOrder();
+      this.scheduleFolderNoteRender();
     } catch (e) {
     }
   }
@@ -1594,15 +3441,10 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Yuque Order Drag V1" });
+    containerEl.createEl("h2", { text: "Yuque Sorting" });
     containerEl.createEl("p", {
-      text: "\u4F7F\u7528 Markdown frontmatter \u4E2D\u7684 guid \u4F5C\u4E3A\u7A33\u5B9A\u8EAB\u4EFD\uFF1B\u987A\u5E8F\u4FDD\u5B58\u5728\u63D2\u4EF6 data.json\uFF0C\u4E0D\u4FEE\u6539\u6587\u4EF6\u540D\u3002"
+      text: "\u65B0\u6587\u4EF6\u4F7F\u7528 f- GUID\uFF0C\u65B0\u6587\u4EF6\u5939\u4F7F\u7528\u72EC\u7ACB d- GUID\uFF1B\u987A\u5E8F\u4FDD\u5B58\u5728\u63D2\u4EF6\u6570\u636E\u4E2D\uFF0C\u4E0D\u4FEE\u6539\u6587\u4EF6\u540D\u3002"
     });
-    new import_obsidian.Setting(containerEl).setName("\u8EAB\u4EFD\u5B57\u6BB5").setDesc("\u9ED8\u8BA4\u4F7F\u7528 guid\uFF1B\u4FEE\u6539\u540E\u53EA\u5F71\u54CD\u4E4B\u540E\u8BC6\u522B\u7684\u6587\u4EF6\u3002").addText((text) => text.setValue(this.plugin.data.settings.orderFrontmatterKey).onChange(async (value) => {
-      this.plugin.data.settings.orderFrontmatterKey = value.trim() || "guid";
-      await this.plugin.reconcileVault(true);
-      await this.plugin.saveSettings();
-    }));
     new import_obsidian.Setting(containerEl).setName("\u65B0\u589E\u9879\u4F4D\u7F6E").setDesc("\u65B0\u5EFA Markdown \u6216\u6587\u4EF6\u5939\u52A0\u5165\u5F53\u524D\u76EE\u5F55\u65F6\u7684\u4F4D\u7F6E\u3002").addDropdown((dropdown) => dropdown.addOption("bottom", "\u5E95\u90E8").addOption("top", "\u9876\u90E8").setValue(this.plugin.data.settings.newItemPlacement).onChange(async (value) => {
       this.plugin.data.settings.newItemPlacement = value;
       await this.plugin.saveSettings();
@@ -1620,6 +3462,31 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.data.settings.enableDrag = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u624B\u52A8\u5BFC\u5165/\u91CD\u540C\u6B65").setDesc("\u5148\u6838\u5BF9\u5F53\u524D\u5E93\u4E0E\u6E05\u5355\uFF1B\u4E00\u81F4\u65F6\u76F4\u63A5\u5BFC\u5165\uFF0C\u4E0D\u4E00\u81F4\u65F6\u7531\u4F60\u786E\u8BA4\u662F\u5426\u7EE7\u7EED\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u5BFC\u5165").onClick(() => void this.plugin.requestManifestImport()));
+    new import_obsidian.Setting(containerEl).setName("GUID \u968F\u673A\u4F4D\u6570").setDesc("\u540E\u7F00\u4EC5\u542B\u6570\u5B57\u548C\u5B57\u6BCD\uFF1A64 bit \u4E3A 11 \u4F4D\uFF0C72 bit \u4E3A 13 \u4F4D\u3002\u65B0\u9879\u76EE\u548C\u7EF4\u62A4\u64CD\u4F5C\u4F7F\u7528\u6B64\u8BBE\u7F6E\u3002").addDropdown((dropdown) => dropdown.addOption("64", "64 bit").addOption("72", "72 bit").setValue(String(this.plugin.data.settings.guidBits)).onChange(async (value) => {
+      this.plugin.data.settings.guidBits = value === "72" ? 72 : 64;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u542F\u52A8\u65F6\u68C0\u6D4B\u91CD\u590D GUID").setDesc("\u9ED8\u8BA4\u5173\u95ED\u3002\u5F00\u542F\u540E\u53EA\u8BFB\u68C0\u6D4B\u5E76\u63D0\u793A\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u4FEE\u6539\u6587\u4EF6\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.scanDuplicateGuidsOnStartup).onChange(async (value) => {
+      this.plugin.data.settings.scanDuplicateGuidsOnStartup = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").setDesc("\u65B0\u6E05\u5355\u9996\u6B21\u91C7\u7528\u5BFC\u51FA\u8EAB\u4EFD\u548C\u987A\u5E8F\uFF1B\u518D\u6B21\u6267\u884C\u4EC5\u6062\u590D\u987A\u5E8F\uFF0C\u4E0D\u8986\u76D6\u4E4B\u540E\u66F4\u6362\u7684 GUID\u3002").addButton((button) => button.setButtonText("\u6062\u590D\u539F\u8BED\u96C0\u76EE\u5F55\u987A\u5E8F").onClick(() => void this.plugin.requestManifestImport()));
+    new import_obsidian.Setting(containerEl).setName("\u68C0\u6D4B\u672A\u7BA1\u7406\u9879\u76EE").setDesc("\u53EA\u8BFB\u626B\u63CF\u6574\u4E2A Vault\uFF1B\u786E\u8BA4\u540E\u624D\u4E3A\u7F3A\u5C11 GUID \u7684\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u751F\u6210\u8EAB\u4EFD\u3002\u63D2\u4EF6\u8FD0\u884C\u671F\u95F4\u590D\u5236\u6216\u65B0\u5EFA\u7684\u9879\u76EE\u901A\u5E38\u5DF2\u88AB\u5B9E\u65F6\u81EA\u52A8\u7EB3\u5165\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u7EB3\u5165\u7BA1\u7406").onClick(() => void this.plugin.auditAndOfferManagement()));
+    new import_obsidian.Setting(containerEl).setName("\u5C06\u5F53\u524D\u5E93\u4E2D\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939\u7EB3\u5165\u672C\u63D2\u4EF6\u7BA1\u7406").setDesc("\u4E3A\u6307\u5B9A\u6587\u4EF6\u6216\u6587\u4EF6\u5939\uFF08\u5305\u542B\u6587\u4EF6\u5939\u672C\u8EAB\u548C\u6587\u4EF6\u5939\u4E0B\u7684\u5185\u5BB9\uFF09\u751F\u6210\u7F3A\u5931 GUID\uFF0C\u6216\u91CD\u65B0\u751F\u6210GUID\u5E76\u5EFA\u7ACB\u6392\u5E8F\u7D22\u5F15\uFF0C\u4FEE\u6539\u540E\u4E0D\u6539\u53D8\u539F\u4F4D\u7F6E\u3002\u8BE5\u529F\u80FD\u4E5F\u53EF\u7528\u4F5C\u91CD\u7F6E\u6392\u5E8F\u7D22\u5F15\u3002").addButton((button) => button.setButtonText("\u9009\u62E9\u6587\u4EF6\u548C\u6587\u4EF6\u5939").onClick(() => this.plugin.openIdentitySelection()));
+    new import_obsidian.Setting(containerEl).setName("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").setDesc("\u9009\u62E9\u6E90\u5E93\u548C\u5F53\u524D\u5E93\u4E2D\u7684\u76EE\u6807\u76EE\u5F55\uFF0C\u9884\u68C0\u540C\u540D\u51B2\u7A81\uFF1B\u652F\u6301\u6574\u9879\u66FF\u6362\u3001\u91CD\u547D\u540D\u548C\u7F16\u53F7\u3002\u6BCF\u6B21\u64CD\u4F5C\u4F1A\u5728\u63D2\u4EF6\u76EE\u5F55\u751F\u6210 local-copy-* \u5907\u4EFD\u4E0E\u8BB0\u5F55\u6587\u4EF6\u5939\u3002\u786E\u8BA4\u590D\u5236\u7ED3\u679C\u3001\u6392\u5E8F\u90FD\u6B63\u5E38\uFF0C\u4E14\u4E0D\u518D\u9700\u8981\u6062\u590D\u8BB0\u5F55\u540E\uFF0C\u53EF\u4EE5\u5220\u9664\u5BF9\u5E94\u7684 local-copy-* \u6587\u4EF6\u5939\uFF08\u4F8B\u5982 local-copy-DJKYhp\uFF09\uFF1B\u4E0D\u8981\u5220\u9664\u63D2\u4EF6\u76EE\u5F55\u4E2D\u6B63\u5728\u4F7F\u7528\u7684 data.json\u3002").addButton((button) => button.setButtonText("\u8DE8Vault\u5408\u5E76\uFF08\u81EA\u52A8\u590D\u5236\uFF09").onClick(() => this.plugin.openLocalCopy()));
+    new import_obsidian.Setting(containerEl).setName("\u63A5\u7BA1\u5386\u53F2 Obsidian Vault").setDesc("\u7528\u4E8E\u6CA1\u6709 GUID\u3001\u6CA1\u6709\u63D2\u4EF6 data.json \u7684\u65E7\u5E93\uFF1A\u8865\u5168\u7F3A\u5931\u8EAB\u4EFD\u4E0E\u76EE\u5F55\u7D22\u5F15\uFF0C\u5E76\u6309\u5F53\u524D\u663E\u793A\u7ED3\u6784\u91CD\u5EFA\u987A\u5E8F\uFF1B\u4E0D\u79FB\u52A8\u6216\u91CD\u547D\u540D\u6587\u4EF6\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u5E76\u63A5\u7BA1\u5386\u53F2\u5E93").onClick(() => void this.plugin.takeOverHistoricalVault()));
+    new import_obsidian.Setting(containerEl).setName("\u5408\u5E76\u5C55\u793A\u914D\u5BF9\u6587\u4EF6\u5939\u7B14\u8BB0").setDesc("\u4EC5\u5339\u914D\u4F4D\u4E8E\u540C\u540D\u6587\u4EF6\u5939\u5185\u3001\u4E14 f-/d- GUID \u540E\u7F00\u76F8\u540C\u7684 Markdown\u3002\u540D\u79F0\u65C1\u7684 \u2197 \u8868\u793A\u5DF2\u5408\u5E76\uFF0C\u70B9\u51FB\u6807\u9898\u6253\u5F00\u6587\u6863\u3002").addToggle((toggle) => toggle.setValue(this.plugin.data.settings.mergePairedFolderNotes).onChange(async (value) => {
+      this.plugin.data.settings.mergePairedFolderNotes = value;
+      await this.plugin.saveSettings();
+      this.plugin.refreshExplorer();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u91CD\u590D GUID").setDesc("\u6309\u5B8C\u6574 GUID \u68C0\u6D4B\uFF1B\u4FEE\u590D\u65F6\u4FDD\u7559\u5F53\u524D\u987A\u5E8F\u4E2D\u7684\u9996\u9879\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u4FEE\u590D").onClick(() => void this.plugin.checkDuplicateGuids(true)));
+    new import_obsidian.Setting(containerEl).setName("\u5168\u5E93\u66F4\u6362 GUID").setDesc("\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u6362\u53F7\uFF0C\u521B\u5EFA\u6062\u590D\u70B9\u5E76\u4FDD\u6301\u76EE\u5F55\u987A\u5E8F\u3002").addButton((button) => button.setButtonText("\u4E0D\u5907\u4EFD").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false))).addButton((button) => button.setButtonText("\u66F4\u6362\u5E76\u5907\u4EFD").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
+    if (this.plugin.data.guidBackups.length) {
+      containerEl.createEl("h3", { text: "GUID \u6062\u590D\u70B9\uFF08\u6700\u591A 3 \u4EFD\uFF09" });
+      [...this.plugin.data.guidBackups].reverse().forEach((backup) => {
+        new import_obsidian.Setting(containerEl).setName(new Date(backup.createdAt).toLocaleString()).setDesc(`${backup.count} \u9879\uFF0C${backup.bits} bit`).addButton((button) => button.setButtonText("\u6062\u590D").onClick(() => void this.plugin.restoreGuidBackup(backup)));
+      });
+    }
   }
 };

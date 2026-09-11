@@ -1,7 +1,7 @@
 {
-  "id": "yuque-order-drag",
-  "name": "Yuque Order Drag",
-  "version": "0.2.1",
+  "id": "yuque-sorting",
+  "name": "Yuque Sorting",
+  "version": "0.3.9",
   "minAppVersion": "1.5.0",
   "description": "Use stable guid identities and a per-folder order list to reproduce Yuque-style document ordering.",
   "author": "YuqueOut",
