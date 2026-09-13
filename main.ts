@@ -2882,9 +2882,6 @@ class YqOrderSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Yuque Sorting" });
-    containerEl.createEl("p", {
-      text: "新文件使用 f- GUID，新文件夹使用独立 d- GUID；顺序保存在插件数据中，不修改文件名。",
-    });
 
     const section = (text: string): void => { new Setting(containerEl).setName(text).setHeading(); };
 

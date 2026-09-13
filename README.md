@@ -37,8 +37,19 @@ Builds always update `dist/`. To also deploy into a local test Vault, set `YUQUE
 
 ```bash
 npm install
-npm run build
 npm test
+```
+
+构建插件产物到 `dist/`：
+
+```bash
+npm run build
+```
+
+打包插件：
+
+```bash
+npm run pack
 ```
 
 The build emits `main.js` beside `manifest.json` and `styles.css`, copies all three plugin artifacts into `dist/`, and deploys only those files to the configured test vault. Set `YUQUE_ORDER_TEST_PLUGIN_DIR` to override the default test-vault plugin directory. `data.json` and `guid-backups` are never copied or removed.

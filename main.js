@@ -3548,9 +3548,6 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Yuque Sorting" });
-    containerEl.createEl("p", {
-      text: "\u65B0\u6587\u4EF6\u4F7F\u7528 f- GUID\uFF0C\u65B0\u6587\u4EF6\u5939\u4F7F\u7528\u72EC\u7ACB d- GUID\uFF1B\u987A\u5E8F\u4FDD\u5B58\u5728\u63D2\u4EF6\u6570\u636E\u4E2D\uFF0C\u4E0D\u4FEE\u6539\u6587\u4EF6\u540D\u3002"
-    });
     const section = (text) => {
       new import_obsidian.Setting(containerEl).setName(text).setHeading();
     };
