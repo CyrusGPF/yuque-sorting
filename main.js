@@ -4013,7 +4013,7 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "yuque-sorting" });
+    new import_obsidian.Setting(containerEl).setName("yuque-sorting").setHeading();
     const section = (text) => {
       new import_obsidian.Setting(containerEl).setName(text).setHeading();
     };
@@ -4096,7 +4096,7 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("\u91CD\u590D GUID").setDesc("\u6309\u5B8C\u6574 GUID \u68C0\u6D4B\uFF1B\u4FEE\u590D\u65F6\u4FDD\u7559\u5F53\u524D\u987A\u5E8F\u4E2D\u7684\u9996\u9879\u3002").addButton((button) => button.setButtonText("\u68C0\u6D4B\u5E76\u4FEE\u590D").onClick(() => void this.plugin.checkDuplicateGuids(true)));
     new import_obsidian.Setting(containerEl).setName("\u5168\u5E93\u66F4\u6362 GUID").setDesc("\u4E3A\u5168\u90E8\u6587\u4EF6\u548C\u6587\u4EF6\u5939\u6362\u53F7\uFF0C\u53EF\u9009\u62E9\u662F\u5426\u521B\u5EFA\u6062\u590D\u70B9\u3002").addButton((button) => button.setButtonText("\u4E0D\u5907\u4EFD").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false))).addButton((button) => button.setButtonText("\u66F4\u6362\u5E76\u5907\u4EFD").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
     if (this.plugin.data.guidBackups.length) {
-      containerEl.createEl("h4", { text: "GUID \u6062\u590D\u70B9\uFF08\u6700\u591A 3 \u4EFD\uFF09" });
+      new import_obsidian.Setting(containerEl).setName("GUID \u6062\u590D\u70B9\uFF08\u6700\u591A 3 \u4EFD\uFF09").setHeading();
       [...this.plugin.data.guidBackups].reverse().forEach((backup) => {
         new import_obsidian.Setting(containerEl).setName(new Date(backup.createdAt).toLocaleString()).setDesc(`${backup.count} \u9879\uFF0C${backup.bits} bit`).addButton((button) => button.setButtonText("\u6062\u590D").onClick(() => void this.plugin.restoreGuidBackup(backup)));
       });

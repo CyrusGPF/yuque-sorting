@@ -3272,7 +3272,7 @@ class YqOrderSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "yuque-sorting" });
+    new Setting(containerEl).setName("yuque-sorting").setHeading();
 
     const section = (text: string): void => { new Setting(containerEl).setName(text).setHeading(); };
 
@@ -3412,7 +3412,7 @@ class YqOrderSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("不备份").onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, false)))
       .addButton((button) => button.setButtonText("更换并备份").setWarning().onClick(() => void this.plugin.replaceAllGuids(this.plugin.data.settings.guidBits, true)));
     if (this.plugin.data.guidBackups.length) {
-      containerEl.createEl("h4", { text: "GUID 恢复点（最多 3 份）" });
+      new Setting(containerEl).setName("GUID 恢复点（最多 3 份）").setHeading();
       [...this.plugin.data.guidBackups].reverse().forEach((backup) => {
         new Setting(containerEl).setName(new Date(backup.createdAt).toLocaleString()).setDesc(`${backup.count} 项，${backup.bits} bit`)
           .addButton((button) => button.setButtonText("恢复").onClick(() => void this.plugin.restoreGuidBackup(backup)));

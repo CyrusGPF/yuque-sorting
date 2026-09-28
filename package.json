@@ -1,6 +1,6 @@
 {
   "name": "yuque-sorting",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "private": true,
   "type": "module",
   "description": "Obsidian Yuque Sorting plugin",

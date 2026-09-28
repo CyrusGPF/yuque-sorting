@@ -1,7 +1,7 @@
 {
   "id": "yuque-sorting",
   "name": "yuque-sorting",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "minAppVersion": "1.5.0",
   "description": "Use stable guid identities and a per-folder order list to reproduce Yuque-style document ordering.",
   "author": "CyrusGPF",
