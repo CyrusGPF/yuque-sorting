@@ -346,7 +346,7 @@ test("Yuque manifest order is applied only through explicit manual entry points"
   // 设置页按功能分区并保持固定顺序，避免又变回一长串平铺设置。
   assert.match(source, /setName\(text\)\.setHeading\(\)/);
   const sectionTitles = [...source.matchAll(/section\("([^"]+)"\);/g)].map(match => match[1]);
-  assert.deepEqual(sectionTitles, ["排序规则", "文件树交互", "语雀清单", "GUID 管理", "旧库接管与跨库迁移"]);
+  assert.deepEqual(sectionTitles, ["同步数据状态", "排序规则", "文件树交互", "语雀清单", "GUID 管理", "旧库接管与跨库迁移"]);
   // 顶部只保留插件名：分区标题已经说明结构，不再放一段总述。
   assert.doesNotMatch(source, /新文件使用 f- GUID/);
 });

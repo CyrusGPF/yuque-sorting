@@ -8,7 +8,7 @@ Yuque Sorting is the Obsidian companion for current YuqueOut exports.
 
 1. In YuqueOut, choose 64-bit (default) or 72-bit GUIDs. Markdown identities and `_yuque_order.json` are generated automatically.
 2. Copy the exported knowledge base into an Obsidian vault.
-3. Install this folder as `.obsidian/plugins/yuque-sorting/`, enable the plugin, and let it scan the vault.
+3. Install this folder as `.obsidian/plugins/yuque-sorting/` and enable it. If `data.json` is absent, sync that file first or explicitly run **初始化本地目录顺序** for a genuinely new vault.
 4. Run **恢复原语雀目录顺序**. New export IDs adopt exported identities once; later explicit runs restore order only.
 
 ## Precise drag and drop
@@ -22,6 +22,10 @@ Yuque Sorting is the Obsidian companion for current YuqueOut exports.
 New files use `f-` identities and folders use independent `d-` identities. The suffix is Base62: 64-bit uses 11 alphanumeric characters and 72-bit uses 13. Legacy `f:`/`d:` identities remain readable. The plugin also detects exact duplicate GUIDs, can replace every vault identity without changing order, and keeps up to three on-demand backup files outside the always-loaded `data.json`.
 
 The manifest is never imported automatically. An `exportId` initializes once unless the user explicitly invokes manifest-based order restoration; the plugin never deletes or rewrites it.
+
+## Synced order data
+
+An absent `data.json` leaves the plugin waiting without creating a competing local file. The settings page offers **检查同步数据** and explicit local initialization. While running, the plugin checks for external `data.json` changes and reloads a valid stable version. Independent changes to different folders can merge; overlapping changes pause writes and offer a choice after backing up the discarded version as `data-recovery-*.json`. Invalid, missing, or partially written data pauses writes rather than replacing it. A sync service can still choose not to download a remote version; the plugin cannot inspect a version that never reaches this vault.
 
 The settings page also provides a read-only unmanaged-item audit, searchable multi-selection for GUID generation/regeneration, historical-vault takeover, and strict paired folder-note display. Pairing requires a direct `folder/folder.md` relationship plus identical `d-token`/`f-token` suffixes; hiding is DOM-only and never removes the note from ordering or disk.
 

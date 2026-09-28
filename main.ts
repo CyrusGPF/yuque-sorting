@@ -55,6 +55,7 @@ import { chooseDirectory } from "./src/directory-picker";
 import type { CopyChoice, LocalRuntime, DiskEntry } from "./src/local-copy";
 import { sourceTransfer, yamlObject } from "./src/local-source";
 import { renderManifestRestoreView } from "./src/manifest-restore-view";
+import { mergeOrderData, validateStoredOrderData } from "./src/order-data-sync";
 const MANIFEST_NAME = "_yuque_order.json";
 const GUID_FRONTMATTER_KEY = "guid";
 
@@ -334,6 +335,16 @@ class IdentitySelectionModal extends Modal {
 
 export default class YqOrderDragPlugin extends Plugin {
   data!: OrderData;
+  private storageState: "ready" | "waiting" | "blocked" = "ready";
+  private hasTrustedMemoryData = false;
+  private storageRaw: string | null = null;
+  private storageBaseline: OrderData | null = null;
+  private storageConflict: { raw: string; disk: OrderData; local: OrderData; conflicts: string[] } | null = null;
+  private rejectedStorageRaw: string | null = null;
+  private storageCheckPromise: Promise<void> | null = null;
+  private storageOperation: Promise<void> = Promise.resolve();
+  private lastSaveError: Error | null = null;
+  private deferredVaultEvents: Array<{ kind: "create" | "delete" | "rename"; file: TAbstractFile; oldPath?: string }> = [];
   private guidByPath = new Map<string, string>();
   private guidPromises = new Map<string, Promise<string>>();
   private saveTimer: number | null = null;
@@ -373,7 +384,7 @@ export default class YqOrderDragPlugin extends Plugin {
   private handledRenames = new WeakMap<TAbstractFile, { key: string; done: Promise<void> }>();
 
   async onload(): Promise<void> {
-    this.data = this.normalizeData((await this.loadData()) as Partial<OrderData> | null);
+    await this.loadInitialOrderData();
 
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
@@ -393,6 +404,9 @@ export default class YqOrderDragPlugin extends Plugin {
       name: "刷新语雀式文件顺序",
       callback: () => void this.reconcileVault(true),
     });
+    this.addCommand({ id: "initialize-local-order-data", name: "初始化本地目录顺序", callback: () => void this.initializeLocalOrderData() });
+    this.addCommand({ id: "reload-synced-order-data", name: "检查同步后的排序数据", callback: () => void this.checkExternalOrderData(true) });
+    this.addCommand({ id: "recover-order-data-from-memory", name: "从当前内存恢复排序数据", callback: () => this.confirmMemoryRecovery() });
     this.addCommand({
       id: "undo-last-yuque-drag",
       name: "撤销上一次语雀拖拽",
@@ -424,6 +438,10 @@ export default class YqOrderDragPlugin extends Plugin {
       },
     });
     this.addSettingTab(new YqOrderSettingTab(this.app, this));
+    this.registerInterval(window.setInterval(() => {
+      if (document.visibilityState !== "hidden") void this.checkExternalOrderData();
+    }, 5000));
+    this.registerDomEvent(window, "focus", () => void this.checkExternalOrderData());
 
     // Defer vault-wide reconciliation to onLayoutReady. Obsidian finishes
     // indexing the vault as part of startup, and on a slow first load (or a
@@ -436,6 +454,12 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async boot(): Promise<void> {
+    if (this.storageState !== "ready") {
+      new Notice(this.storageState === "waiting"
+        ? "尚无排序数据：请先完成同步，或手动执行“初始化本地目录顺序”"
+        : "排序数据暂不可用；已暂停写入，请检查或恢复 data.json", 10000);
+      return;
+    }
     await this.reconcileVault(false);
     if (this.data.settings.scanDuplicateGuidsOnStartup) await this.checkDuplicateGuids(false);
     this.setupExplorer();
@@ -445,7 +469,7 @@ export default class YqOrderDragPlugin extends Plugin {
   onunload(): void {
     this.autoCopyCancelled = true;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
-    if (this.saveDirty) void this.enqueueDirtySave();
+    if (this.saveDirty && this.storageState === "ready") void this.enqueueDirtySave();
     if (this.explorerRefreshFrame !== null) window.cancelAnimationFrame(this.explorerRefreshFrame);
     if (this.domOrderFrame !== null) window.cancelAnimationFrame(this.domOrderFrame);
     if (this.folderNoteFrame !== null) window.cancelAnimationFrame(this.folderNoteFrame);
@@ -455,6 +479,282 @@ export default class YqOrderDragPlugin extends Plugin {
     this.restoreExplorerPatch?.();
     this.restoreExplorerPatch = null;
     this.explorerPatchActive = false;
+  }
+
+  private orderDataPath(): string {
+    return normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`);
+  }
+
+  private async readOrderDataRaw(): Promise<string | null> {
+    const adapter = this.app.vault.adapter;
+    const path = this.orderDataPath();
+    if (!await adapter.exists(path)) return null;
+    return adapter.read(path);
+  }
+
+  private cloneOrderData(data: OrderData): OrderData {
+    return JSON.parse(JSON.stringify(data)) as OrderData;
+  }
+
+  private withStorageLock<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.storageOperation.then(work, work);
+    this.storageOperation = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private parseOrderData(raw: string): OrderData {
+    return this.normalizeData(validateStoredOrderData(raw) as unknown as Partial<OrderData>);
+  }
+
+  private async loadInitialOrderData(): Promise<void> {
+    // The adapter is available on every supported Obsidian platform. The
+    // fallback keeps lightweight plugin mocks and unusual adapters usable.
+    if (!this.app.vault.adapter?.exists || !this.app.vault.adapter?.read) {
+      this.data = this.normalizeData((await this.loadData()) as Partial<OrderData> | null);
+      this.hasTrustedMemoryData = true;
+      this.storageBaseline = this.cloneOrderData(this.data);
+      return;
+    }
+    let raw: string | null = null;
+    try {
+      raw = await this.readOrderDataRaw();
+      if (raw === null) {
+        this.storageState = "waiting";
+        this.data = this.normalizeData(null);
+      } else {
+        this.data = this.parseOrderData(raw);
+        this.hasTrustedMemoryData = true;
+      }
+      this.storageRaw = raw;
+      this.storageBaseline = this.cloneOrderData(this.data);
+    } catch (error) {
+      this.storageState = "blocked";
+      this.rejectedStorageRaw = raw;
+      this.data = this.normalizeData(null);
+      this.storageBaseline = this.cloneOrderData(this.data);
+      console.error("[Yuque Sorting] Cannot load data.json; writes are paused.", error);
+    }
+  }
+
+  getOrderDataStatus(): "ready" | "waiting" | "blocked" { return this.storageState; }
+
+  private canMutateOrderData(): boolean {
+    if (this.storageState === "ready") return true;
+    new Notice("排序数据尚未就绪；请先完成同步或处理冲突", 10000);
+    return false;
+  }
+
+  private async replayDeferredVaultEvents(): Promise<void> {
+    const events = this.deferredVaultEvents.splice(0);
+    for (const event of events) {
+      try {
+        if (event.kind === "create") {
+          if (this.app.vault.getAbstractFileByPath(event.file.path) === event.file) await this.handleCreate(event.file);
+        } else if (event.kind === "delete") {
+          // A path may have been recreated during the pause. Never remove the
+          // identity of a live replacement based on the old delete event.
+          if (!this.app.vault.getAbstractFileByPath(event.file.path)) await this.handleDelete(event.file);
+        } else if (event.oldPath && this.app.vault.getAbstractFileByPath(event.file.path) === event.file) {
+          await this.handleRename(event.file, event.oldPath);
+        }
+      } catch (error) {
+        console.error("[Yuque Sorting] Failed to replay a vault event after sync.", error);
+        new Notice(`同步后处理文件变更失败：${String(error)}`, 10000);
+      }
+    }
+  }
+
+  async initializeLocalOrderData(): Promise<void> {
+    if (this.storageState === "blocked") {
+      new Notice("排序数据处于冲突或损坏状态；请先恢复或选择数据版本", 10000);
+      return;
+    }
+    if (this.storageState === "ready") {
+      new Notice("排序数据已经初始化");
+      return;
+    }
+    const raw = await this.readOrderDataRaw();
+    if (raw !== null) {
+      await this.acceptExternalOrderData(raw);
+      return;
+    }
+    this.storageState = "ready";
+    this.hasTrustedMemoryData = true;
+    this.storageRaw = null;
+    this.storageBaseline = this.cloneOrderData(this.data);
+    this.deferredVaultEvents.length = 0;
+    await this.reconcileVault(true);
+    if (this.storageRaw === null) await this.forceSave();
+    this.setupExplorer();
+    this.refreshExplorer();
+    new Notice("已初始化本地目录顺序");
+  }
+
+  async checkExternalOrderData(interactive = false): Promise<void> {
+    if (!this.app?.vault?.adapter?.exists || !this.app.vault.adapter?.read) return;
+    if (this.storageCheckPromise) return this.storageCheckPromise;
+    this.storageCheckPromise = this.withStorageLock(async () => {
+      let raw: string | null;
+      try { raw = await this.readOrderDataRaw(); }
+      catch (error) {
+        this.storageState = "blocked";
+        if (interactive) new Notice(`无法读取排序数据：${String(error)}`, 10000);
+        return;
+      }
+      if (this.storageState === "blocked" && (raw === this.rejectedStorageRaw || raw === this.storageConflict?.raw)) return;
+      if (raw === this.storageRaw) {
+        if (this.storageState === "blocked") await this.acceptExternalOrderData(raw);
+        else if (interactive) new Notice(raw === null ? "仍在等待同步的排序数据" : "排序数据已是当前版本");
+        return;
+      }
+      // A sync tool can replace the file in several writes. Only adopt a
+      // complete, stable snapshot; a partial JSON must never become the base.
+      await new Promise(resolve => window.setTimeout(resolve, 300));
+      let stable: string | null;
+      try { stable = await this.readOrderDataRaw(); }
+      catch { return; }
+      if (stable !== raw) return;
+      await this.acceptExternalOrderData(stable);
+    }).finally(() => { this.storageCheckPromise = null; });
+    return this.storageCheckPromise;
+  }
+
+  private async acceptExternalOrderData(raw: string | null): Promise<void> {
+    if (raw === null) {
+      if (this.storageState === "waiting") return;
+      this.storageState = "blocked";
+      this.rejectedStorageRaw = null;
+      new Notice("排序数据被外部删除；已暂停写入，请先恢复 data.json", 12000);
+      return;
+    }
+    let disk: OrderData;
+    try { disk = this.parseOrderData(raw); }
+    catch (error) {
+      this.storageState = "blocked";
+      this.rejectedStorageRaw = raw;
+      new Notice(`同步的排序数据无效，已暂停写入：${String(error)}`, 12000);
+      return;
+    }
+    const base = this.storageBaseline || this.normalizeData(null);
+    const localChanged = JSON.stringify(this.data) !== JSON.stringify(base);
+    let next = disk;
+    if (localChanged) {
+      const merged = mergeOrderData(base, this.data, disk);
+      if (!merged.data) {
+        this.storageState = "blocked";
+        this.storageConflict = { raw, disk, local: this.cloneOrderData(this.data), conflicts: merged.conflicts };
+        this.showStorageConflict();
+        return;
+      }
+      next = merged.data;
+    }
+    this.data = next;
+    this.storageRaw = raw;
+    this.storageBaseline = this.cloneOrderData(disk);
+    this.storageState = "ready";
+    this.hasTrustedMemoryData = true;
+    this.storageConflict = null;
+    this.rejectedStorageRaw = null;
+    this.guidByPath.clear();
+    this.clearUndoHistory();
+    await this.replayDeferredVaultEvents();
+    await this.reconcileVault(false, false);
+    this.setupExplorer();
+    this.refreshExplorer();
+    if (localChanged && JSON.stringify(next) !== JSON.stringify(disk)) this.queueSave(true);
+  }
+
+  private showStorageConflict(): void {
+    const conflict = this.storageConflict;
+    if (!conflict) return;
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("排序数据同步冲突");
+    modal.contentEl.createEl("p", { text: "本地尚未保存的改动与同步后的 data.json 修改了相同项目。已暂停写入，关闭窗口等同于稍后处理。" });
+    modal.contentEl.createEl("p", { text: conflict.conflicts.slice(0, 8).join("、") + (conflict.conflicts.length > 8 ? "…" : "") });
+    new Setting(modal.contentEl)
+      .addButton(button => button.setButtonText("采用同步版本").onClick(() => { modal.close(); void this.resolveStorageConflict("disk"); }))
+      .addButton(button => button.setButtonText("保留本地并覆盖磁盘").onClick(() => { modal.close(); void this.resolveStorageConflict("local"); }))
+      .addButton(button => button.setButtonText("稍后处理").onClick(() => modal.close()));
+    modal.open();
+  }
+
+  private async backUpOrderData(raw: string): Promise<string> {
+    const path = normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data-recovery-${Date.now()}-${createGuid("f", 64).slice(2)}.json`);
+    await this.app.vault.adapter.write(path, raw);
+    return path;
+  }
+
+  openOrderDataResolution(): void {
+    if (this.storageConflict) this.showStorageConflict();
+    else this.confirmMemoryRecovery();
+  }
+
+  private confirmMemoryRecovery(): void {
+    if (this.storageState !== "blocked" || this.storageConflict || !this.hasTrustedMemoryData) {
+      new Notice("当前没有可从内存恢复的损坏或缺失数据");
+      return;
+    }
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("从内存恢复排序数据");
+    modal.contentEl.createEl("p", { text: "仅在同步文件缺失或损坏且你确认内存中的顺序正确时执行；原文件若存在会先备份。" });
+    new Setting(modal.contentEl)
+      .addButton(button => button.setButtonText("恢复").onClick(() => { modal.close(); void this.recoverOrderDataFromMemory(); }))
+      .addButton(button => button.setButtonText("取消").onClick(() => modal.close()));
+    modal.open();
+  }
+
+  private async recoverOrderDataFromMemory(): Promise<void> {
+    try {
+      const raw = await this.readOrderDataRaw();
+      if (raw !== null) {
+        try {
+          this.parseOrderData(raw);
+          new Notice("磁盘数据已经恢复有效，请先运行“检查同步后的排序数据”", 10000);
+          return;
+        } catch { await this.backUpOrderData(raw); }
+      }
+      const nextRaw = JSON.stringify(this.data, null, 2);
+      if (await this.readOrderDataRaw() !== raw) throw new Error("恢复前磁盘数据再次变化");
+      await this.app.vault.adapter.write(this.orderDataPath(), nextRaw);
+      this.storageRaw = nextRaw;
+      this.storageBaseline = this.cloneOrderData(this.data);
+      this.storageState = "ready";
+      this.rejectedStorageRaw = null;
+      this.saveDirty = false;
+      await this.replayDeferredVaultEvents();
+      await this.reconcileVault(false, false);
+      this.setupExplorer();
+      this.refreshExplorer();
+      new Notice("已从内存恢复排序数据");
+    } catch (error) { new Notice(`恢复失败：${String(error)}`, 10000); }
+  }
+
+  private async resolveStorageConflict(choice: "disk" | "local"): Promise<void> {
+    const conflict = this.storageConflict;
+    if (!conflict || await this.readOrderDataRaw() !== conflict.raw) {
+      new Notice("排序数据再次变化，请重新检查后选择", 10000);
+      await this.checkExternalOrderData();
+      return;
+    }
+    try {
+      await this.backUpOrderData(choice === "disk" ? JSON.stringify(conflict.local, null, 2) : conflict.raw);
+    } catch (error) {
+      new Notice(`备份冲突数据失败，未执行选择：${String(error)}`, 10000);
+      return;
+    }
+    this.storageRaw = conflict.raw;
+    this.storageBaseline = this.cloneOrderData(conflict.disk);
+    this.data = this.cloneOrderData(choice === "disk" ? conflict.disk : conflict.local);
+    this.storageState = "ready";
+    this.storageConflict = null;
+    this.rejectedStorageRaw = null;
+    this.guidByPath.clear();
+    this.clearUndoHistory();
+    if (choice === "local") await this.forceSave();
+    await this.replayDeferredVaultEvents();
+    await this.reconcileVault(false, false);
+    this.setupExplorer();
+    this.refreshExplorer();
   }
 
   normalizeData(saved: Partial<OrderData> | null): OrderData {
@@ -510,6 +810,7 @@ export default class YqOrderDragPlugin extends Plugin {
   private queueSave(force = false): void {
     if (!force && !this.data.settings.persistOrderOnCreateDelete) return;
     this.saveDirty = true;
+    if (this.storageState !== "ready") return;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
@@ -526,10 +827,13 @@ export default class YqOrderDragPlugin extends Plugin {
         while (this.saveDirty) {
           this.saveDirty = false;
           try {
-            await this.saveData(this.data);
+            await this.persistOrderData();
+            this.lastSaveError = null;
           } catch (error) {
             this.saveDirty = true;
+            this.lastSaveError = error instanceof Error ? error : new Error(String(error));
             console.error("[Yuque Sorting] Failed to save plugin data.", error);
+            new Notice(`排序数据未保存：${this.lastSaveError.message}`, 10000);
             break;
           }
         }
@@ -544,6 +848,7 @@ export default class YqOrderDragPlugin extends Plugin {
     }
     if (this.saveDirty) await this.enqueueDirtySave();
     await this.savePromise;
+    if (this.lastSaveError) throw this.lastSaveError;
   }
 
   private async forceSave(): Promise<void> {
@@ -552,7 +857,51 @@ export default class YqOrderDragPlugin extends Plugin {
       this.saveTimer = null;
     }
     this.saveDirty = true;
-    await this.enqueueDirtySave();
+    await this.flushSave();
+  }
+
+  private async persistOrderData(): Promise<void> {
+    return this.withStorageLock(() => this.persistOrderDataLocked());
+  }
+
+  private async persistOrderDataLocked(): Promise<void> {
+    // Some test adapters only expose Plugin.saveData. In Obsidian, use the
+    // public adapter so the value on disk can be checked before every write.
+    const adapter = this.app.vault.adapter;
+    if (!adapter?.exists || !adapter?.read || !adapter?.write) {
+      await this.saveData(this.data);
+      return;
+    }
+    if (this.storageState !== "ready") throw new Error("排序数据尚未就绪，已暂停写入");
+    const current = await this.readOrderDataRaw();
+    if (current !== this.storageRaw) {
+      await this.acceptExternalOrderData(current);
+      if (this.storageState !== "ready") throw new Error("排序数据已由外部更改，请先处理冲突");
+    }
+    const base = this.storageBaseline;
+    if (this.storageRaw !== null && base && JSON.stringify(this.data) === JSON.stringify(base)) return;
+    const nextRaw = JSON.stringify(this.data, null, 2);
+    const expected = this.storageRaw;
+    const path = this.orderDataPath();
+    if (expected !== null && adapter.process) {
+      try {
+        await adapter.process(path, value => {
+          if (value !== expected) throw new Error("保存时排序数据又被外部更新");
+          return nextRaw;
+        });
+      } catch (error) {
+        void this.checkExternalOrderData();
+        throw error;
+      }
+    } else {
+      if (await this.readOrderDataRaw() !== expected) {
+        void this.checkExternalOrderData();
+        throw new Error("保存前排序数据发生变化");
+      }
+      await adapter.write(path, nextRaw);
+    }
+    this.storageRaw = nextRaw;
+    this.storageBaseline = this.cloneOrderData(this.data);
   }
 
   async saveSettings(): Promise<void> {
@@ -560,7 +909,8 @@ export default class YqOrderDragPlugin extends Plugin {
     await this.forceSave();
   }
 
-  async reconcileVault(forceRefresh: boolean): Promise<void> {
+  async reconcileVault(forceRefresh: boolean, persist = true): Promise<void> {
+    if (this.storageState !== "ready") return;
     if (this.transferInProgress) return;
     const all = this.app.vault.getAllLoadedFiles();
     const files = all.filter((file): file is TFile => file instanceof TFile);
@@ -581,7 +931,7 @@ export default class YqOrderDragPlugin extends Plugin {
     for (const folder of folders) this.reconcileFolder(folder);
     // The full scan also creates folder identities and initial order lists;
     // persist that reconciliation even when event persistence is disabled.
-    await this.forceSave();
+    if (persist) await this.forceSave();
     if (forceRefresh) this.refreshExplorer();
   }
 
@@ -754,6 +1104,10 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async handleCreate(file: TAbstractFile): Promise<void> {
+    if (this.storageState !== "ready") {
+      if (this.app.workspace.layoutReady) this.deferredVaultEvents.push({ kind: "create", file });
+      return;
+    }
     if (this.ownsAutoCopyPath(file.path)) { this.autoCopyLastEvent = Date.now(); return; }
     if (this.transferInProgress) { this.transferEvents.push(() => this.handleCreate(file)); return; }
     // Obsidian's vault initialization fires `create` for every file in the
@@ -777,6 +1131,10 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async handleDelete(file: TAbstractFile): Promise<void> {
+    if (this.storageState !== "ready") {
+      if (this.app.workspace.layoutReady) this.deferredVaultEvents.push({ kind: "delete", file });
+      return;
+    }
     if (this.ownsAutoCopyPath(file.path)) { this.autoCopyLastEvent = Date.now(); return; }
     if (this.transferInProgress) { this.transferEvents.push(() => this.handleDelete(file)); return; }
     if (!this.app.workspace.layoutReady) return;
@@ -816,6 +1174,10 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async handleRename(file: TAbstractFile, oldPath: string): Promise<void> {
+    if (this.storageState !== "ready") {
+      if (this.app.workspace.layoutReady) this.deferredVaultEvents.push({ kind: "rename", file, oldPath });
+      return;
+    }
     if (this.ownsAutoCopyPath(file.path) || this.ownsAutoCopyPath(oldPath)) { this.autoCopyLastEvent = Date.now(); return; }
     if (this.transferInProgress) { this.transferEvents.push(() => this.handleRename(file, oldPath)); return; }
     if (!this.app.workspace.layoutReady) return;
@@ -1009,6 +1371,7 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   async auditAndOfferManagement(): Promise<void> {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const unmanaged = await this.collectUnmanagedItems();
     if (!unmanaged.length) {
@@ -1027,6 +1390,7 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   async takeOverHistoricalVault(): Promise<void> {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const unmanaged = await this.collectUnmanagedItems();
     const unindexed = this.collectUnindexedItems();
@@ -1058,6 +1422,7 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   openLocalCopy(): void {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress || this.autoCopyPreparing) { new Notice("已有维护或复制任务正在进行"); return; }
     const modal = new Modal(this.app); modal.setTitle("跨Vault合并（自动复制）");
     modal.contentEl.addClass("yq-copy-modal");
@@ -1089,6 +1454,8 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async copyLocalDirectory(sourceInput: string, destination: string): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress || this.autoCopyPreparing || !this.app.workspace.layoutReady) return;
     const load = (window as any).require;
     const adapter = this.app.vault.adapter as any;
@@ -1279,12 +1646,12 @@ export default class YqOrderDragPlugin extends Plugin {
             for (const path of this.guidByPath.keys()) if (this.ownsAutoCopyPath(path)) this.guidByPath.delete(path);
             for (const entry of pack.items) this.guidByPath.set(prefix + mappedPaths.get(entry.path)!, replacements.get(entry.path)!);
             for (const [path, guid] of missingGuids) this.guidByPath.set(path, guid);
-            await this.saveData(this.data);
+            await this.persistOrderData();
           }, rollbackData: async () => {
             this.data = originalData;
             for (const path of this.guidByPath.keys()) if (this.ownsAutoCopyPath(path)) this.guidByPath.delete(path);
             for (const [path, guid] of oldGuids) this.guidByPath.set(path, guid);
-            await this.saveData(originalData); await removeCreatedEmptyFolders(); await waitForIndex(oldScope);
+            await this.persistOrderData(); await removeCreatedEmptyFolders(); await waitForIndex(oldScope);
           } });
         copyComplete = true;
         this.clearUndoHistory();
@@ -1310,6 +1677,7 @@ export default class YqOrderDragPlugin extends Plugin {
 
 
   openIdentitySelection(): void {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     new IdentitySelectionModal(this.app, this.manageableItems(), (paths, mode) => {
       void this.applyIdentitySelection(paths, mode);
@@ -1317,6 +1685,7 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private addIdentityMenuItems(menu: Menu, item: TAbstractFile): void {
+    if (this.storageState !== "ready") return;
     if (!(item instanceof TFile || item instanceof TFolder) || !item.path) return;
     const guid = this.getItemGuidSync(item);
     menu.addItem((entry) => entry
@@ -1360,6 +1729,8 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async setPairMergeOverride(token: string, merged: boolean): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     this.data.folderNoteMergeOverrides[token] = merged;
     await this.forceSave();
     this.scheduleFolderNoteRender();
@@ -1420,6 +1791,8 @@ export default class YqOrderDragPlugin extends Plugin {
     orderSnapshot?: Record<string, string[]>,
     successLabel = "已处理",
   ): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const items = [...new Set(paths)]
       .map((path) => this.app.vault.getAbstractFileByPath(path))
@@ -1487,6 +1860,7 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   async checkDuplicateGuids(interactive: boolean): Promise<void> {
+    if (interactive && !this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const state = this.collectIdentityState();
     const groups = findDuplicateIdentities(state.entries);
@@ -1572,6 +1946,8 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   async replaceAllGuids(bits: GuidBits, createBackup: boolean): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const proceed = await new Promise<boolean>((resolve) => new ConfirmActionModal(
       this.app, "为整个库更换 GUID", `将为全部文件和文件夹生成 ${bits} bit GUID，并保持当前目录顺序。${createBackup ? "将创建恢复点。" : "不会创建持久恢复点。"}`, "开始更换", resolve,
@@ -1640,6 +2016,8 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   async restoreGuidBackup(meta: GuidBackupMeta): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const changed: Array<IdentityEntry & { replacementGuid: string }> = [];
     let currentOrders: Record<string, string[]> | null = null;
@@ -1683,6 +2061,8 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   async requestManifestImport(): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
     if (!manifests.length) {
       new Notice("未找到 _yuque_order.json");
@@ -1852,6 +2232,8 @@ export default class YqOrderDragPlugin extends Plugin {
       problems.length ? "确认恢复匹配项" : "确认恢复目录顺序", resolve, renderManifestRestoreDetails,
     ).open());
     if (!proceed) return;
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress || JSON.stringify(this.data) !== dataBeforeConfirmation || fileState() !== filesBeforeConfirmation) {
       new Notice("确认期间文件、GUID 或目录顺序发生变化，请重新检查后恢复"); return;
     }
@@ -2399,7 +2781,9 @@ export default class YqOrderDragPlugin extends Plugin {
       event.preventDefault();
       const targetPath = this.pathFromElement(target);
       const position = this.dropPosition(this.dragSourcePath, targetPath, event.clientY, target);
-      void this.handleDrop(this.dragSourcePath, targetPath, position);
+      void this.handleDrop(this.dragSourcePath, targetPath, position).catch(error => {
+        new Notice(`拖拽未完成：${String(error)}；请检查文件树和排序数据`, 12000);
+      });
       this.clearDragState();
     }, true);
     this.registerDomEvent(document, "dragend", () => this.clearDragState(), true);
@@ -2475,6 +2859,8 @@ export default class YqOrderDragPlugin extends Plugin {
   }
 
   private async undoLastDrag(): Promise<void> {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     const record = this.dragUndoStack.length ? this.dragUndoStack[this.dragUndoStack.length - 1] : this.lastDragUndo;
     if (!record || this.undoInProgress) return;
 
@@ -2583,6 +2969,11 @@ export default class YqOrderDragPlugin extends Plugin {
     if (this.dropInProgress || this.undoInProgress) return;
     this.dropInProgress = true;
     try {
+      if (this.app?.vault?.adapter) await this.checkExternalOrderData();
+      if (this.storageState !== "ready") {
+        new Notice("排序数据正在等待同步或处理冲突，暂不能拖拽排序", 10000);
+        return;
+      }
       await this.executeDrop(sourcePath, targetPath, position);
     } finally {
       this.dropInProgress = false;
@@ -2884,6 +3275,23 @@ class YqOrderSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Yuque Sorting" });
 
     const section = (text: string): void => { new Setting(containerEl).setName(text).setHeading(); };
+
+    const storageStatus = this.plugin.getOrderDataStatus();
+    if (storageStatus !== "ready") {
+      section("同步数据状态");
+      new Setting(containerEl)
+        .setName(storageStatus === "waiting" ? "等待排序数据" : "排序数据已暂停写入")
+        .setDesc(storageStatus === "waiting"
+          ? "先完成云端同步；如果这是全新库且云端没有排序数据，再手动初始化。"
+          : "磁盘数据缺失、损坏或与本地改动冲突。处理前不会用内存数据覆盖磁盘。")
+        .addButton(button => button.setButtonText("检查同步数据").onClick(() => void this.plugin.checkExternalOrderData(true).then(() => this.display())))
+        .addButton(button => button.setButtonText(storageStatus === "waiting" ? "初始化本地顺序" : "处理冲突或恢复")
+          .onClick(() => {
+            if (storageStatus === "waiting") void this.plugin.initializeLocalOrderData().then(() => this.display());
+            else this.plugin.openOrderDataResolution();
+          }));
+      return;
+    }
 
     section("排序规则");
     new Setting(containerEl)

@@ -892,6 +892,91 @@ function renderManifestRestoreView(container, view) {
   notes.forEach((note) => noteList.createEl("li", { text: note }));
 }
 
+// src/order-data-sync.ts
+var MAP_FIELDS = [
+  "settings",
+  "orderByFolder",
+  "folderGuids",
+  "fileGuids",
+  "detachedFolderNotes",
+  "folderNoteMergeOverrides",
+  "transferReceipts"
+];
+var same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+function mergeOrderData(base, local, disk) {
+  const baseline = base;
+  const ours = local;
+  const theirs = disk;
+  const result = {};
+  const conflicts = [];
+  const fields = /* @__PURE__ */ new Set([...Object.keys(baseline), ...Object.keys(ours), ...Object.keys(theirs)]);
+  for (const field of fields) {
+    if (MAP_FIELDS.includes(field)) {
+      const previous = baseline[field] || {};
+      const current = ours[field] || {};
+      const incoming = theirs[field] || {};
+      const merged = {};
+      const keys = /* @__PURE__ */ new Set([...Object.keys(previous), ...Object.keys(current), ...Object.keys(incoming)]);
+      for (const key2 of keys) {
+        const a = previous[key2], b = current[key2], c = incoming[key2];
+        if (same(b, c)) {
+          if (b !== void 0) merged[key2] = b;
+        } else if (same(a, b)) {
+          if (c !== void 0) merged[key2] = c;
+        } else if (same(a, c)) {
+          if (b !== void 0) merged[key2] = b;
+        } else conflicts.push(`${field}.${key2}`);
+      }
+      result[field] = merged;
+    } else {
+      const a = baseline[field], b = ours[field], c = theirs[field];
+      if (same(b, c)) result[field] = b;
+      else if (same(a, b)) result[field] = c;
+      else if (same(a, c)) result[field] = b;
+      else conflicts.push(field);
+    }
+  }
+  if (!conflicts.length) {
+    const pathsByGuid = /* @__PURE__ */ new Map();
+    for (const field of ["folderGuids", "fileGuids"]) {
+      for (const [path, guid] of Object.entries(result[field] || {})) {
+        if (typeof guid !== "string") continue;
+        const previousPath = pathsByGuid.get(guid);
+        if (previousPath && previousPath !== `${field}.${path}`) conflicts.push(`duplicateGuid.${guid}`);
+        else pathsByGuid.set(guid, `${field}.${path}`);
+      }
+    }
+  }
+  return { data: conflicts.length ? null : result, conflicts };
+}
+function validateStoredOrderData(raw) {
+  const value = JSON.parse(raw.replace(/^\uFEFF/, ""));
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("data.json \u9876\u5C42\u5FC5\u987B\u662F\u5BF9\u8C61");
+  const saved = value;
+  if (saved.version !== void 0 && saved.version !== 1 && saved.version !== 2) {
+    throw new Error("data.json \u7248\u672C\u4E0D\u53D7\u652F\u6301");
+  }
+  if (saved.orderByFolder === void 0) throw new Error("data.json \u7F3A\u5C11\u76EE\u5F55\u987A\u5E8F");
+  for (const field of ["settings", ...MAP_FIELDS.filter((name) => name !== "settings")]) {
+    const mapping = saved[field];
+    if (mapping === void 0) continue;
+    if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
+      throw new Error(`data.json \u7684 ${field} \u65E0\u6548`);
+    }
+  }
+  for (const [key2, order] of Object.entries(saved.orderByFolder || {})) {
+    if (!Array.isArray(order) || order.some((guid) => typeof guid !== "string")) {
+      throw new Error(`data.json \u7684\u76EE\u5F55\u987A\u5E8F ${key2} \u65E0\u6548`);
+    }
+  }
+  for (const field of ["folderGuids", "fileGuids", "detachedFolderNotes"]) {
+    for (const [path, guid] of Object.entries(saved[field] || {})) {
+      if (typeof guid !== "string") throw new Error(`data.json \u7684 ${field}.${path} \u65E0\u6548`);
+    }
+  }
+  return saved;
+}
+
 // main.ts
 var MANIFEST_NAME = "_yuque_order.json";
 var GUID_FRONTMATTER_KEY = "guid";
@@ -1078,6 +1163,16 @@ var IdentitySelectionModal = class extends import_obsidian.Modal {
 var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
+    this.storageState = "ready";
+    this.hasTrustedMemoryData = false;
+    this.storageRaw = null;
+    this.storageBaseline = null;
+    this.storageConflict = null;
+    this.rejectedStorageRaw = null;
+    this.storageCheckPromise = null;
+    this.storageOperation = Promise.resolve();
+    this.lastSaveError = null;
+    this.deferredVaultEvents = [];
     this.guidByPath = /* @__PURE__ */ new Map();
     this.guidPromises = /* @__PURE__ */ new Map();
     this.saveTimer = null;
@@ -1117,7 +1212,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     this.handledRenames = /* @__PURE__ */ new WeakMap();
   }
   async onload() {
-    this.data = this.normalizeData(await this.loadData());
+    await this.loadInitialOrderData();
     this.registerEvent(this.app.vault.on("create", (file) => void this.handleCreate(file)));
     this.registerEvent(this.app.vault.on("delete", (file) => void this.handleDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleRename(file, oldPath)));
@@ -1137,6 +1232,9 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
       name: "\u5237\u65B0\u8BED\u96C0\u5F0F\u6587\u4EF6\u987A\u5E8F",
       callback: () => void this.reconcileVault(true)
     });
+    this.addCommand({ id: "initialize-local-order-data", name: "\u521D\u59CB\u5316\u672C\u5730\u76EE\u5F55\u987A\u5E8F", callback: () => void this.initializeLocalOrderData() });
+    this.addCommand({ id: "reload-synced-order-data", name: "\u68C0\u67E5\u540C\u6B65\u540E\u7684\u6392\u5E8F\u6570\u636E", callback: () => void this.checkExternalOrderData(true) });
+    this.addCommand({ id: "recover-order-data-from-memory", name: "\u4ECE\u5F53\u524D\u5185\u5B58\u6062\u590D\u6392\u5E8F\u6570\u636E", callback: () => this.confirmMemoryRecovery() });
     this.addCommand({
       id: "undo-last-yuque-drag",
       name: "\u64A4\u9500\u4E0A\u4E00\u6B21\u8BED\u96C0\u62D6\u62FD",
@@ -1171,9 +1269,17 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addSettingTab(new YqOrderSettingTab(this.app, this));
+    this.registerInterval(window.setInterval(() => {
+      if (document.visibilityState !== "hidden") void this.checkExternalOrderData();
+    }, 5e3));
+    this.registerDomEvent(window, "focus", () => void this.checkExternalOrderData());
     this.app.workspace.onLayoutReady(() => void this.boot());
   }
   async boot() {
+    if (this.storageState !== "ready") {
+      new import_obsidian.Notice(this.storageState === "waiting" ? "\u5C1A\u65E0\u6392\u5E8F\u6570\u636E\uFF1A\u8BF7\u5148\u5B8C\u6210\u540C\u6B65\uFF0C\u6216\u624B\u52A8\u6267\u884C\u201C\u521D\u59CB\u5316\u672C\u5730\u76EE\u5F55\u987A\u5E8F\u201D" : "\u6392\u5E8F\u6570\u636E\u6682\u4E0D\u53EF\u7528\uFF1B\u5DF2\u6682\u505C\u5199\u5165\uFF0C\u8BF7\u68C0\u67E5\u6216\u6062\u590D data.json", 1e4);
+      return;
+    }
     await this.reconcileVault(false);
     if (this.data.settings.scanDuplicateGuidsOnStartup) await this.checkDuplicateGuids(false);
     this.setupExplorer();
@@ -1183,7 +1289,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     var _a, _b, _c;
     this.autoCopyCancelled = true;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
-    if (this.saveDirty) void this.enqueueDirtySave();
+    if (this.saveDirty && this.storageState === "ready") void this.enqueueDirtySave();
     if (this.explorerRefreshFrame !== null) window.cancelAnimationFrame(this.explorerRefreshFrame);
     if (this.domOrderFrame !== null) window.cancelAnimationFrame(this.domOrderFrame);
     if (this.folderNoteFrame !== null) window.cancelAnimationFrame(this.folderNoteFrame);
@@ -1193,6 +1299,278 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     (_c = this.restoreExplorerPatch) == null ? void 0 : _c.call(this);
     this.restoreExplorerPatch = null;
     this.explorerPatchActive = false;
+  }
+  orderDataPath() {
+    return (0, import_obsidian.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`);
+  }
+  async readOrderDataRaw() {
+    const adapter = this.app.vault.adapter;
+    const path = this.orderDataPath();
+    if (!await adapter.exists(path)) return null;
+    return adapter.read(path);
+  }
+  cloneOrderData(data) {
+    return JSON.parse(JSON.stringify(data));
+  }
+  withStorageLock(work) {
+    const next = this.storageOperation.then(work, work);
+    this.storageOperation = next.then(() => void 0, () => void 0);
+    return next;
+  }
+  parseOrderData(raw) {
+    return this.normalizeData(validateStoredOrderData(raw));
+  }
+  async loadInitialOrderData() {
+    var _a, _b;
+    if (!((_a = this.app.vault.adapter) == null ? void 0 : _a.exists) || !((_b = this.app.vault.adapter) == null ? void 0 : _b.read)) {
+      this.data = this.normalizeData(await this.loadData());
+      this.hasTrustedMemoryData = true;
+      this.storageBaseline = this.cloneOrderData(this.data);
+      return;
+    }
+    let raw = null;
+    try {
+      raw = await this.readOrderDataRaw();
+      if (raw === null) {
+        this.storageState = "waiting";
+        this.data = this.normalizeData(null);
+      } else {
+        this.data = this.parseOrderData(raw);
+        this.hasTrustedMemoryData = true;
+      }
+      this.storageRaw = raw;
+      this.storageBaseline = this.cloneOrderData(this.data);
+    } catch (error) {
+      this.storageState = "blocked";
+      this.rejectedStorageRaw = raw;
+      this.data = this.normalizeData(null);
+      this.storageBaseline = this.cloneOrderData(this.data);
+      console.error("[Yuque Sorting] Cannot load data.json; writes are paused.", error);
+    }
+  }
+  getOrderDataStatus() {
+    return this.storageState;
+  }
+  canMutateOrderData() {
+    if (this.storageState === "ready") return true;
+    new import_obsidian.Notice("\u6392\u5E8F\u6570\u636E\u5C1A\u672A\u5C31\u7EEA\uFF1B\u8BF7\u5148\u5B8C\u6210\u540C\u6B65\u6216\u5904\u7406\u51B2\u7A81", 1e4);
+    return false;
+  }
+  async replayDeferredVaultEvents() {
+    const events = this.deferredVaultEvents.splice(0);
+    for (const event of events) {
+      try {
+        if (event.kind === "create") {
+          if (this.app.vault.getAbstractFileByPath(event.file.path) === event.file) await this.handleCreate(event.file);
+        } else if (event.kind === "delete") {
+          if (!this.app.vault.getAbstractFileByPath(event.file.path)) await this.handleDelete(event.file);
+        } else if (event.oldPath && this.app.vault.getAbstractFileByPath(event.file.path) === event.file) {
+          await this.handleRename(event.file, event.oldPath);
+        }
+      } catch (error) {
+        console.error("[Yuque Sorting] Failed to replay a vault event after sync.", error);
+        new import_obsidian.Notice(`\u540C\u6B65\u540E\u5904\u7406\u6587\u4EF6\u53D8\u66F4\u5931\u8D25\uFF1A${String(error)}`, 1e4);
+      }
+    }
+  }
+  async initializeLocalOrderData() {
+    if (this.storageState === "blocked") {
+      new import_obsidian.Notice("\u6392\u5E8F\u6570\u636E\u5904\u4E8E\u51B2\u7A81\u6216\u635F\u574F\u72B6\u6001\uFF1B\u8BF7\u5148\u6062\u590D\u6216\u9009\u62E9\u6570\u636E\u7248\u672C", 1e4);
+      return;
+    }
+    if (this.storageState === "ready") {
+      new import_obsidian.Notice("\u6392\u5E8F\u6570\u636E\u5DF2\u7ECF\u521D\u59CB\u5316");
+      return;
+    }
+    const raw = await this.readOrderDataRaw();
+    if (raw !== null) {
+      await this.acceptExternalOrderData(raw);
+      return;
+    }
+    this.storageState = "ready";
+    this.hasTrustedMemoryData = true;
+    this.storageRaw = null;
+    this.storageBaseline = this.cloneOrderData(this.data);
+    this.deferredVaultEvents.length = 0;
+    await this.reconcileVault(true);
+    if (this.storageRaw === null) await this.forceSave();
+    this.setupExplorer();
+    this.refreshExplorer();
+    new import_obsidian.Notice("\u5DF2\u521D\u59CB\u5316\u672C\u5730\u76EE\u5F55\u987A\u5E8F");
+  }
+  async checkExternalOrderData(interactive = false) {
+    var _a, _b, _c, _d;
+    if (!((_c = (_b = (_a = this.app) == null ? void 0 : _a.vault) == null ? void 0 : _b.adapter) == null ? void 0 : _c.exists) || !((_d = this.app.vault.adapter) == null ? void 0 : _d.read)) return;
+    if (this.storageCheckPromise) return this.storageCheckPromise;
+    this.storageCheckPromise = this.withStorageLock(async () => {
+      var _a2;
+      let raw;
+      try {
+        raw = await this.readOrderDataRaw();
+      } catch (error) {
+        this.storageState = "blocked";
+        if (interactive) new import_obsidian.Notice(`\u65E0\u6CD5\u8BFB\u53D6\u6392\u5E8F\u6570\u636E\uFF1A${String(error)}`, 1e4);
+        return;
+      }
+      if (this.storageState === "blocked" && (raw === this.rejectedStorageRaw || raw === ((_a2 = this.storageConflict) == null ? void 0 : _a2.raw))) return;
+      if (raw === this.storageRaw) {
+        if (this.storageState === "blocked") await this.acceptExternalOrderData(raw);
+        else if (interactive) new import_obsidian.Notice(raw === null ? "\u4ECD\u5728\u7B49\u5F85\u540C\u6B65\u7684\u6392\u5E8F\u6570\u636E" : "\u6392\u5E8F\u6570\u636E\u5DF2\u662F\u5F53\u524D\u7248\u672C");
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
+      let stable;
+      try {
+        stable = await this.readOrderDataRaw();
+      } catch (e) {
+        return;
+      }
+      if (stable !== raw) return;
+      await this.acceptExternalOrderData(stable);
+    }).finally(() => {
+      this.storageCheckPromise = null;
+    });
+    return this.storageCheckPromise;
+  }
+  async acceptExternalOrderData(raw) {
+    if (raw === null) {
+      if (this.storageState === "waiting") return;
+      this.storageState = "blocked";
+      this.rejectedStorageRaw = null;
+      new import_obsidian.Notice("\u6392\u5E8F\u6570\u636E\u88AB\u5916\u90E8\u5220\u9664\uFF1B\u5DF2\u6682\u505C\u5199\u5165\uFF0C\u8BF7\u5148\u6062\u590D data.json", 12e3);
+      return;
+    }
+    let disk;
+    try {
+      disk = this.parseOrderData(raw);
+    } catch (error) {
+      this.storageState = "blocked";
+      this.rejectedStorageRaw = raw;
+      new import_obsidian.Notice(`\u540C\u6B65\u7684\u6392\u5E8F\u6570\u636E\u65E0\u6548\uFF0C\u5DF2\u6682\u505C\u5199\u5165\uFF1A${String(error)}`, 12e3);
+      return;
+    }
+    const base = this.storageBaseline || this.normalizeData(null);
+    const localChanged = JSON.stringify(this.data) !== JSON.stringify(base);
+    let next = disk;
+    if (localChanged) {
+      const merged = mergeOrderData(base, this.data, disk);
+      if (!merged.data) {
+        this.storageState = "blocked";
+        this.storageConflict = { raw, disk, local: this.cloneOrderData(this.data), conflicts: merged.conflicts };
+        this.showStorageConflict();
+        return;
+      }
+      next = merged.data;
+    }
+    this.data = next;
+    this.storageRaw = raw;
+    this.storageBaseline = this.cloneOrderData(disk);
+    this.storageState = "ready";
+    this.hasTrustedMemoryData = true;
+    this.storageConflict = null;
+    this.rejectedStorageRaw = null;
+    this.guidByPath.clear();
+    this.clearUndoHistory();
+    await this.replayDeferredVaultEvents();
+    await this.reconcileVault(false, false);
+    this.setupExplorer();
+    this.refreshExplorer();
+    if (localChanged && JSON.stringify(next) !== JSON.stringify(disk)) this.queueSave(true);
+  }
+  showStorageConflict() {
+    const conflict = this.storageConflict;
+    if (!conflict) return;
+    const modal = new import_obsidian.Modal(this.app);
+    modal.titleEl.setText("\u6392\u5E8F\u6570\u636E\u540C\u6B65\u51B2\u7A81");
+    modal.contentEl.createEl("p", { text: "\u672C\u5730\u5C1A\u672A\u4FDD\u5B58\u7684\u6539\u52A8\u4E0E\u540C\u6B65\u540E\u7684 data.json \u4FEE\u6539\u4E86\u76F8\u540C\u9879\u76EE\u3002\u5DF2\u6682\u505C\u5199\u5165\uFF0C\u5173\u95ED\u7A97\u53E3\u7B49\u540C\u4E8E\u7A0D\u540E\u5904\u7406\u3002" });
+    modal.contentEl.createEl("p", { text: conflict.conflicts.slice(0, 8).join("\u3001") + (conflict.conflicts.length > 8 ? "\u2026" : "") });
+    new import_obsidian.Setting(modal.contentEl).addButton((button) => button.setButtonText("\u91C7\u7528\u540C\u6B65\u7248\u672C").onClick(() => {
+      modal.close();
+      void this.resolveStorageConflict("disk");
+    })).addButton((button) => button.setButtonText("\u4FDD\u7559\u672C\u5730\u5E76\u8986\u76D6\u78C1\u76D8").onClick(() => {
+      modal.close();
+      void this.resolveStorageConflict("local");
+    })).addButton((button) => button.setButtonText("\u7A0D\u540E\u5904\u7406").onClick(() => modal.close()));
+    modal.open();
+  }
+  async backUpOrderData(raw) {
+    const path = (0, import_obsidian.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data-recovery-${Date.now()}-${createGuid("f", 64).slice(2)}.json`);
+    await this.app.vault.adapter.write(path, raw);
+    return path;
+  }
+  openOrderDataResolution() {
+    if (this.storageConflict) this.showStorageConflict();
+    else this.confirmMemoryRecovery();
+  }
+  confirmMemoryRecovery() {
+    if (this.storageState !== "blocked" || this.storageConflict || !this.hasTrustedMemoryData) {
+      new import_obsidian.Notice("\u5F53\u524D\u6CA1\u6709\u53EF\u4ECE\u5185\u5B58\u6062\u590D\u7684\u635F\u574F\u6216\u7F3A\u5931\u6570\u636E");
+      return;
+    }
+    const modal = new import_obsidian.Modal(this.app);
+    modal.titleEl.setText("\u4ECE\u5185\u5B58\u6062\u590D\u6392\u5E8F\u6570\u636E");
+    modal.contentEl.createEl("p", { text: "\u4EC5\u5728\u540C\u6B65\u6587\u4EF6\u7F3A\u5931\u6216\u635F\u574F\u4E14\u4F60\u786E\u8BA4\u5185\u5B58\u4E2D\u7684\u987A\u5E8F\u6B63\u786E\u65F6\u6267\u884C\uFF1B\u539F\u6587\u4EF6\u82E5\u5B58\u5728\u4F1A\u5148\u5907\u4EFD\u3002" });
+    new import_obsidian.Setting(modal.contentEl).addButton((button) => button.setButtonText("\u6062\u590D").onClick(() => {
+      modal.close();
+      void this.recoverOrderDataFromMemory();
+    })).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => modal.close()));
+    modal.open();
+  }
+  async recoverOrderDataFromMemory() {
+    try {
+      const raw = await this.readOrderDataRaw();
+      if (raw !== null) {
+        try {
+          this.parseOrderData(raw);
+          new import_obsidian.Notice("\u78C1\u76D8\u6570\u636E\u5DF2\u7ECF\u6062\u590D\u6709\u6548\uFF0C\u8BF7\u5148\u8FD0\u884C\u201C\u68C0\u67E5\u540C\u6B65\u540E\u7684\u6392\u5E8F\u6570\u636E\u201D", 1e4);
+          return;
+        } catch (e) {
+          await this.backUpOrderData(raw);
+        }
+      }
+      const nextRaw = JSON.stringify(this.data, null, 2);
+      if (await this.readOrderDataRaw() !== raw) throw new Error("\u6062\u590D\u524D\u78C1\u76D8\u6570\u636E\u518D\u6B21\u53D8\u5316");
+      await this.app.vault.adapter.write(this.orderDataPath(), nextRaw);
+      this.storageRaw = nextRaw;
+      this.storageBaseline = this.cloneOrderData(this.data);
+      this.storageState = "ready";
+      this.rejectedStorageRaw = null;
+      this.saveDirty = false;
+      await this.replayDeferredVaultEvents();
+      await this.reconcileVault(false, false);
+      this.setupExplorer();
+      this.refreshExplorer();
+      new import_obsidian.Notice("\u5DF2\u4ECE\u5185\u5B58\u6062\u590D\u6392\u5E8F\u6570\u636E");
+    } catch (error) {
+      new import_obsidian.Notice(`\u6062\u590D\u5931\u8D25\uFF1A${String(error)}`, 1e4);
+    }
+  }
+  async resolveStorageConflict(choice) {
+    const conflict = this.storageConflict;
+    if (!conflict || await this.readOrderDataRaw() !== conflict.raw) {
+      new import_obsidian.Notice("\u6392\u5E8F\u6570\u636E\u518D\u6B21\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u540E\u9009\u62E9", 1e4);
+      await this.checkExternalOrderData();
+      return;
+    }
+    try {
+      await this.backUpOrderData(choice === "disk" ? JSON.stringify(conflict.local, null, 2) : conflict.raw);
+    } catch (error) {
+      new import_obsidian.Notice(`\u5907\u4EFD\u51B2\u7A81\u6570\u636E\u5931\u8D25\uFF0C\u672A\u6267\u884C\u9009\u62E9\uFF1A${String(error)}`, 1e4);
+      return;
+    }
+    this.storageRaw = conflict.raw;
+    this.storageBaseline = this.cloneOrderData(conflict.disk);
+    this.data = this.cloneOrderData(choice === "disk" ? conflict.disk : conflict.local);
+    this.storageState = "ready";
+    this.storageConflict = null;
+    this.rejectedStorageRaw = null;
+    this.guidByPath.clear();
+    this.clearUndoHistory();
+    if (choice === "local") await this.forceSave();
+    await this.replayDeferredVaultEvents();
+    await this.reconcileVault(false, false);
+    this.setupExplorer();
+    this.refreshExplorer();
   }
   normalizeData(saved) {
     const savedSettings = (saved == null ? void 0 : saved.settings) || {};
@@ -1238,6 +1616,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
   queueSave(force = false) {
     if (!force && !this.data.settings.persistOrderOnCreateDelete) return;
     this.saveDirty = true;
+    if (this.storageState !== "ready") return;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
@@ -1251,10 +1630,13 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
       while (this.saveDirty) {
         this.saveDirty = false;
         try {
-          await this.saveData(this.data);
+          await this.persistOrderData();
+          this.lastSaveError = null;
         } catch (error) {
           this.saveDirty = true;
+          this.lastSaveError = error instanceof Error ? error : new Error(String(error));
           console.error("[Yuque Sorting] Failed to save plugin data.", error);
+          new import_obsidian.Notice(`\u6392\u5E8F\u6570\u636E\u672A\u4FDD\u5B58\uFF1A${this.lastSaveError.message}`, 1e4);
           break;
         }
       }
@@ -1268,6 +1650,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     }
     if (this.saveDirty) await this.enqueueDirtySave();
     await this.savePromise;
+    if (this.lastSaveError) throw this.lastSaveError;
   }
   async forceSave() {
     if (this.saveTimer !== null) {
@@ -1275,7 +1658,47 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
       this.saveTimer = null;
     }
     this.saveDirty = true;
-    await this.enqueueDirtySave();
+    await this.flushSave();
+  }
+  async persistOrderData() {
+    return this.withStorageLock(() => this.persistOrderDataLocked());
+  }
+  async persistOrderDataLocked() {
+    const adapter = this.app.vault.adapter;
+    if (!(adapter == null ? void 0 : adapter.exists) || !(adapter == null ? void 0 : adapter.read) || !(adapter == null ? void 0 : adapter.write)) {
+      await this.saveData(this.data);
+      return;
+    }
+    if (this.storageState !== "ready") throw new Error("\u6392\u5E8F\u6570\u636E\u5C1A\u672A\u5C31\u7EEA\uFF0C\u5DF2\u6682\u505C\u5199\u5165");
+    const current = await this.readOrderDataRaw();
+    if (current !== this.storageRaw) {
+      await this.acceptExternalOrderData(current);
+      if (this.storageState !== "ready") throw new Error("\u6392\u5E8F\u6570\u636E\u5DF2\u7531\u5916\u90E8\u66F4\u6539\uFF0C\u8BF7\u5148\u5904\u7406\u51B2\u7A81");
+    }
+    const base = this.storageBaseline;
+    if (this.storageRaw !== null && base && JSON.stringify(this.data) === JSON.stringify(base)) return;
+    const nextRaw = JSON.stringify(this.data, null, 2);
+    const expected = this.storageRaw;
+    const path = this.orderDataPath();
+    if (expected !== null && adapter.process) {
+      try {
+        await adapter.process(path, (value) => {
+          if (value !== expected) throw new Error("\u4FDD\u5B58\u65F6\u6392\u5E8F\u6570\u636E\u53C8\u88AB\u5916\u90E8\u66F4\u65B0");
+          return nextRaw;
+        });
+      } catch (error) {
+        void this.checkExternalOrderData();
+        throw error;
+      }
+    } else {
+      if (await this.readOrderDataRaw() !== expected) {
+        void this.checkExternalOrderData();
+        throw new Error("\u4FDD\u5B58\u524D\u6392\u5E8F\u6570\u636E\u53D1\u751F\u53D8\u5316");
+      }
+      await adapter.write(path, nextRaw);
+    }
+    this.storageRaw = nextRaw;
+    this.storageBaseline = this.cloneOrderData(this.data);
   }
   async saveSettings() {
     if (this.autoCopyPreparing && this.transferInProgress) {
@@ -1284,7 +1707,8 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     }
     await this.forceSave();
   }
-  async reconcileVault(forceRefresh) {
+  async reconcileVault(forceRefresh, persist = true) {
+    if (this.storageState !== "ready") return;
     if (this.transferInProgress) return;
     const all = this.app.vault.getAllLoadedFiles();
     const files = all.filter((file) => file instanceof import_obsidian.TFile);
@@ -1293,7 +1717,7 @@ var YqOrderDragPlugin = class extends import_obsidian.Plugin {
     for (const file of files) await this.ensureFileGuid(file);
     for (const folder of folders) await this.ensureFolderGuid(folder);
     for (const folder of folders) this.reconcileFolder(folder);
-    await this.forceSave();
+    if (persist) await this.forceSave();
     if (forceRefresh) this.refreshExplorer();
   }
   reconcileFolder(folder) {
@@ -1462,6 +1886,10 @@ ${body}
     );
   }
   async handleCreate(file) {
+    if (this.storageState !== "ready") {
+      if (this.app.workspace.layoutReady) this.deferredVaultEvents.push({ kind: "create", file });
+      return;
+    }
     if (this.ownsAutoCopyPath(file.path)) {
       this.autoCopyLastEvent = Date.now();
       return;
@@ -1483,6 +1911,10 @@ ${body}
     this.refreshExplorer();
   }
   async handleDelete(file) {
+    if (this.storageState !== "ready") {
+      if (this.app.workspace.layoutReady) this.deferredVaultEvents.push({ kind: "delete", file });
+      return;
+    }
     if (this.ownsAutoCopyPath(file.path)) {
       this.autoCopyLastEvent = Date.now();
       return;
@@ -1525,6 +1957,10 @@ ${body}
   }
   async handleRename(file, oldPath) {
     var _a;
+    if (this.storageState !== "ready") {
+      if (this.app.workspace.layoutReady) this.deferredVaultEvents.push({ kind: "rename", file, oldPath });
+      return;
+    }
     if (this.ownsAutoCopyPath(file.path) || this.ownsAutoCopyPath(oldPath)) {
       this.autoCopyLastEvent = Date.now();
       return;
@@ -1711,6 +2147,7 @@ ${file.path}`;
     });
   }
   async auditAndOfferManagement() {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const unmanaged = await this.collectUnmanagedItems();
     if (!unmanaged.length) {
@@ -1728,6 +2165,7 @@ ${file.path}`;
     if (proceed) await this.applyIdentitySelection(unmanaged.map((item) => item.path), "missing");
   }
   async takeOverHistoricalVault() {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const unmanaged = await this.collectUnmanagedItems();
     const unindexed = this.collectUnindexedItems();
@@ -1759,6 +2197,7 @@ ${file.path}`;
     return scope.roots.has(path.slice(prefix.length).split("/")[0]);
   }
   openLocalCopy() {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress || this.autoCopyPreparing) {
       new import_obsidian.Notice("\u5DF2\u6709\u7EF4\u62A4\u6216\u590D\u5236\u4EFB\u52A1\u6B63\u5728\u8FDB\u884C");
       return;
@@ -1806,6 +2245,8 @@ ${file.path}`;
     modal.open();
   }
   async copyLocalDirectory(sourceInput, destination) {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress || this.autoCopyPreparing || !this.app.workspace.layoutReady) return;
     const load = window.require;
     const adapter = this.app.vault.adapter;
@@ -2037,13 +2478,13 @@ ${file.path}`;
             for (const path of this.guidByPath.keys()) if (this.ownsAutoCopyPath(path)) this.guidByPath.delete(path);
             for (const entry of pack.items) this.guidByPath.set(prefix + mappedPaths.get(entry.path), replacements.get(entry.path));
             for (const [path, guid] of missingGuids) this.guidByPath.set(path, guid);
-            await this.saveData(this.data);
+            await this.persistOrderData();
           },
           rollbackData: async () => {
             this.data = originalData;
             for (const path of this.guidByPath.keys()) if (this.ownsAutoCopyPath(path)) this.guidByPath.delete(path);
             for (const [path, guid] of oldGuids) this.guidByPath.set(path, guid);
-            await this.saveData(originalData);
+            await this.persistOrderData();
             await removeCreatedEmptyFolders();
             await waitForIndex(oldScope);
           }
@@ -2073,12 +2514,14 @@ ${file.path}`;
     return folder;
   }
   openIdentitySelection() {
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     new IdentitySelectionModal(this.app, this.manageableItems(), (paths, mode) => {
       void this.applyIdentitySelection(paths, mode);
     }).open();
   }
   addIdentityMenuItems(menu, item) {
+    if (this.storageState !== "ready") return;
     if (!(item instanceof import_obsidian.TFile || item instanceof import_obsidian.TFolder) || !item.path) return;
     const guid = this.getItemGuidSync(item);
     menu.addItem((entry) => entry.setTitle(guid ? "\u91CD\u65B0\u751F\u6210 GUID \u5E76\u7EB3\u5165\u7BA1\u7406" : "\u751F\u6210 GUID \u5E76\u7EB3\u5165\u7BA1\u7406").setIcon(guid ? "refresh-cw" : "fingerprint").onClick(() => void this.applyIdentitySelection([item.path], guid ? "regenerate" : "missing")));
@@ -2112,6 +2555,8 @@ ${file.path}`;
     return mergeChoice(this.data.settings.mergePairedFolderNotes, this.data.folderNoteMergeOverrides, pair.token);
   }
   async setPairMergeOverride(token, merged) {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     this.data.folderNoteMergeOverrides[token] = merged;
     await this.forceSave();
     this.scheduleFolderNoteRender();
@@ -2159,6 +2604,8 @@ ${file.path}`;
     });
   }
   async applyIdentitySelection(paths, mode, orderSnapshot, successLabel = "\u5DF2\u5904\u7406") {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const items = [...new Set(paths)].map((path) => this.app.vault.getAbstractFileByPath(path)).filter((item) => item instanceof import_obsidian.TFile || item instanceof import_obsidian.TFolder);
     if (!items.length && !orderSnapshot) {
@@ -2238,6 +2685,7 @@ ${file.path}`;
     }
   }
   async checkDuplicateGuids(interactive) {
+    if (interactive && !this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const state = this.collectIdentityState();
     const groups = findDuplicateIdentities(state.entries);
@@ -2328,6 +2776,8 @@ ${file.path}`;
     }
   }
   async replaceAllGuids(bits, createBackup) {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const proceed = await new Promise((resolve) => new ConfirmActionModal(
       this.app,
@@ -2409,6 +2859,8 @@ ${file.path}`;
     }
   }
   async restoreGuidBackup(meta) {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress) return;
     const changed = [];
     let currentOrders = null;
@@ -2460,6 +2912,8 @@ ${file.path}`;
   }
   async requestManifestImport() {
     var _a, _b, _c;
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     const manifests = this.app.vault.getFiles().filter((file) => file.name === MANIFEST_NAME);
     if (!manifests.length) {
       new import_obsidian.Notice("\u672A\u627E\u5230 _yuque_order.json");
@@ -2643,6 +3097,8 @@ ${file.path}`;
       renderManifestRestoreDetails
     ).open());
     if (!proceed) return;
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     if (this.identityMaintenanceInProgress || JSON.stringify(this.data) !== dataBeforeConfirmation || fileState() !== filesBeforeConfirmation) {
       new import_obsidian.Notice("\u786E\u8BA4\u671F\u95F4\u6587\u4EF6\u3001GUID \u6216\u76EE\u5F55\u987A\u5E8F\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u540E\u6062\u590D");
       return;
@@ -3127,7 +3583,9 @@ ${file.path}`;
       event.preventDefault();
       const targetPath = this.pathFromElement(target);
       const position = this.dropPosition(this.dragSourcePath, targetPath, event.clientY, target);
-      void this.handleDrop(this.dragSourcePath, targetPath, position);
+      void this.handleDrop(this.dragSourcePath, targetPath, position).catch((error) => {
+        new import_obsidian.Notice(`\u62D6\u62FD\u672A\u5B8C\u6210\uFF1A${String(error)}\uFF1B\u8BF7\u68C0\u67E5\u6587\u4EF6\u6811\u548C\u6392\u5E8F\u6570\u636E`, 12e3);
+      });
       this.clearDragState();
     }, true);
     this.registerDomEvent(document, "dragend", () => this.clearDragState(), true);
@@ -3192,6 +3650,8 @@ ${file.path}`;
     }
   }
   async undoLastDrag() {
+    await this.checkExternalOrderData();
+    if (!this.canMutateOrderData()) return;
     const record = this.dragUndoStack.length ? this.dragUndoStack[this.dragUndoStack.length - 1] : this.lastDragUndo;
     if (!record || this.undoInProgress) return;
     const source = this.app.vault.getAbstractFileByPath(record.sourceMovedPath);
@@ -3284,10 +3744,16 @@ ${file.path}`;
     }
   }
   async handleDrop(sourcePath, targetPath, position) {
+    var _a, _b;
     if (this.transferInProgress) return;
     if (this.dropInProgress || this.undoInProgress) return;
     this.dropInProgress = true;
     try {
+      if ((_b = (_a = this.app) == null ? void 0 : _a.vault) == null ? void 0 : _b.adapter) await this.checkExternalOrderData();
+      if (this.storageState !== "ready") {
+        new import_obsidian.Notice("\u6392\u5E8F\u6570\u636E\u6B63\u5728\u7B49\u5F85\u540C\u6B65\u6216\u5904\u7406\u51B2\u7A81\uFF0C\u6682\u4E0D\u80FD\u62D6\u62FD\u6392\u5E8F", 1e4);
+        return;
+      }
       await this.executeDrop(sourcePath, targetPath, position);
     } finally {
       this.dropInProgress = false;
@@ -3551,6 +4017,15 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
     const section = (text) => {
       new import_obsidian.Setting(containerEl).setName(text).setHeading();
     };
+    const storageStatus = this.plugin.getOrderDataStatus();
+    if (storageStatus !== "ready") {
+      section("\u540C\u6B65\u6570\u636E\u72B6\u6001");
+      new import_obsidian.Setting(containerEl).setName(storageStatus === "waiting" ? "\u7B49\u5F85\u6392\u5E8F\u6570\u636E" : "\u6392\u5E8F\u6570\u636E\u5DF2\u6682\u505C\u5199\u5165").setDesc(storageStatus === "waiting" ? "\u5148\u5B8C\u6210\u4E91\u7AEF\u540C\u6B65\uFF1B\u5982\u679C\u8FD9\u662F\u5168\u65B0\u5E93\u4E14\u4E91\u7AEF\u6CA1\u6709\u6392\u5E8F\u6570\u636E\uFF0C\u518D\u624B\u52A8\u521D\u59CB\u5316\u3002" : "\u78C1\u76D8\u6570\u636E\u7F3A\u5931\u3001\u635F\u574F\u6216\u4E0E\u672C\u5730\u6539\u52A8\u51B2\u7A81\u3002\u5904\u7406\u524D\u4E0D\u4F1A\u7528\u5185\u5B58\u6570\u636E\u8986\u76D6\u78C1\u76D8\u3002").addButton((button) => button.setButtonText("\u68C0\u67E5\u540C\u6B65\u6570\u636E").onClick(() => void this.plugin.checkExternalOrderData(true).then(() => this.display()))).addButton((button) => button.setButtonText(storageStatus === "waiting" ? "\u521D\u59CB\u5316\u672C\u5730\u987A\u5E8F" : "\u5904\u7406\u51B2\u7A81\u6216\u6062\u590D").onClick(() => {
+        if (storageStatus === "waiting") void this.plugin.initializeLocalOrderData().then(() => this.display());
+        else this.plugin.openOrderDataResolution();
+      }));
+      return;
+    }
     section("\u6392\u5E8F\u89C4\u5219");
     new import_obsidian.Setting(containerEl).setName("\u65B0\u589E\u9879\u4F4D\u7F6E").setDesc("\u65B0\u5EFA Markdown \u6216\u6587\u4EF6\u5939\u52A0\u5165\u5F53\u524D\u76EE\u5F55\u65F6\u7684\u4F4D\u7F6E\u3002").addDropdown((dropdown) => dropdown.addOption("bottom", "\u5E95\u90E8").addOption("top", "\u9876\u90E8").setValue(this.plugin.data.settings.newItemPlacement).onChange(async (value) => {
       this.plugin.data.settings.newItemPlacement = value;
