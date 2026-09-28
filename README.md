@@ -1,6 +1,6 @@
-# Yuque Sorting
+# yuque-sorting
 
-Yuque Sorting is the Obsidian companion for current YuqueOut exports.
+yuque-sorting is the desktop Obsidian companion for current YuqueOut exports.
 
 完整中文操作手册请参阅：[YuqueOut 与 Yuque Sorting 使用说明](./使用说明.md)。
 
