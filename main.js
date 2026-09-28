@@ -4013,7 +4013,6 @@ var YqOrderSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("yuque-sorting").setHeading();
     const section = (text) => {
       new import_obsidian.Setting(containerEl).setName(text).setHeading();
     };

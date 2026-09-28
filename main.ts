@@ -3272,7 +3272,6 @@ class YqOrderSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName("yuque-sorting").setHeading();
 
     const section = (text: string): void => { new Setting(containerEl).setName(text).setHeading(); };
 
